@@ -1,6 +1,7 @@
 import { useState, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useAuth } from '@/lib/auth';
+import { WMS_DEFAULT_WAREHOUSE } from '@/lib/supabase';
 import { Eye, EyeOff, Hexagon, Sparkles, Shield, Zap, Package } from 'lucide-react';
 import { Navigate, useNavigate } from 'react-router-dom';
 
@@ -88,10 +89,11 @@ const FEATURES = [
 ];
 
 export default function Login() {
-  const { login, user } = useAuth();
+  const { loginDetailed, user } = useAuth();
   const navigate = useNavigate();
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [warehouseCode, setWarehouseCode] = useState(WMS_DEFAULT_WAREHOUSE);
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
@@ -107,9 +109,9 @@ export default function Login() {
     setError('');
     setLoading(true);
     try {
-      const success = await login(username.trim(), password);
-      if (!success) {
-        setError('Invalid credentials. Check username and password.');
+      const outcome = await loginDetailed(username.trim(), password, warehouseCode);
+      if (!outcome.ok) {
+        setError(outcome.message || 'Invalid credentials. Check username and password.');
         setShake(true);
         setTimeout(() => setShake(false), 500);
       } else {
@@ -289,6 +291,20 @@ export default function Login() {
                       {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                     </button>
                   </div>
+                </div>
+
+                <div>
+                  <label className="text-[10px] uppercase tracking-[0.18em] text-white/35 font-medium ml-0.5">
+                    Warehouse Facility Scope
+                  </label>
+                  <select
+                    value={warehouseCode}
+                    onChange={(e) => setWarehouseCode(e.target.value)}
+                    className="mt-1.5 w-full rounded-xl bg-white/[0.04] border border-white/[0.08] px-4 py-2.5 text-xs font-mono text-white focus:outline-none focus:border-sky-400/40 transition-colors"
+                  >
+                    <option value="DXB-FC1" className="bg-[#0c0c14]">DXB-FC1 — Dubai Fulfillment Center 1</option>
+                    <option value="MSK-HUB2" className="bg-[#0c0c14]">MSK-HUB2 — Moscow Cross-Dock Hub 2</option>
+                  </select>
                 </div>
 
                 <AnimatePresence>

@@ -1,6 +1,7 @@
 import { create } from 'zustand';
-import { persist } from 'zustand/middleware';
+import { persist, createJSONStorage } from 'zustand/middleware';
 import type { ChatMessage } from './aiAssistant';
+import { safeLocalStorage, safeRandomId } from './safeStorage';
 
 interface Notification {
   id: string;
@@ -57,7 +58,7 @@ export const useAppStore = create<AppState>()(
           notifications: [
             {
               ...n,
-              id: crypto.randomUUID(),
+              id: safeRandomId(),
               timestamp: Date.now(),
               read: false,
             },
@@ -100,6 +101,7 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: 'vortex-app-store',
+      storage: createJSONStorage(() => safeLocalStorage),
       partialize: (state) => ({
         autoRefresh: state.autoRefresh,
         refreshInterval: state.refreshInterval,

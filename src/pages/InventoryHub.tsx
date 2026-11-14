@@ -33,7 +33,8 @@ function daysUntilExpiry(expiryDate?: string): number | null {
 }
 
 export default function InventoryHub() {
-  const { user } = useAuth();
+  const { user, can } = useAuth();
+  const canAdjustStock = can('inventory.adjust');
   const [inventory, setInventory] = useState<InventoryItem[]>([]);
   const [movements, setMovements] = useState<InventoryMovement[]>([]);
   const [anomalyAlerts, setAnomalyAlerts] = useState<AnomalyAlert[]>([]);
@@ -53,6 +54,9 @@ export default function InventoryHub() {
   const [showScanner, setShowScanner] = useState(false);
   const [scanMessage, setScanMessage] = useState<string | null>(null);
   const [lotInboundRecords, setLotInboundRecords] = useState<InboundRecord[]>([]);
+  const [tableScrollTop, setTableScrollTop] = useState(0);
+  const ROW_HEIGHT = 44;
+  const VIEWPORT_HEIGHT = 480;
 
   const loadInventory = useCallback(async () => {
     const items = await db.inventory.toArray();
@@ -163,20 +167,38 @@ export default function InventoryHub() {
   const lowStockCount = inventory.filter(isLowStock).length;
 
   const handleStockUpdate = async (id: number) => {
-    const newStock = parseInt(editStock);
+    if (!canAdjustStock) {
+      setEditingId(null);
+      return;
+    }
+    const newStock = parseInt(editStock, 10);
     if (isNaN(newStock) || newStock < 0) return;
+    const prev = inventory.find((i) => i.id === id);
+    const delta = newStock - (prev?.stock || 0);
     await db.inventory.update(id, { stock: newStock, updatedAt: new Date().toISOString() });
+    if (prev && delta !== 0) {
+      await logInventoryMovement(prev.sku, 'adjustment', Math.abs(delta), user?.displayName || 'Supervisor', {
+        toLocation: prev.location,
+        note: `Direct stock override ${prev.stock ?? 0} -> ${newStock}`,
+      });
+      await logAction(
+        'INVENTORY_STOCK_OVERRIDE',
+        `Overrode ${prev.sku} stock from ${prev.stock ?? 0} to ${newStock}`,
+        user?.displayName || 'Supervisor'
+      );
+    }
     setEditingId(null);
     loadInventory();
+    loadMovements();
   };
 
   const handleAdjustment = async () => {
-    if (!adjustItem || !adjustQty) return;
-    const delta = parseInt(adjustQty);
-    if (isNaN(delta)) return;
+    if (!adjustItem || !adjustQty || !canAdjustStock) return;
+    const delta = parseInt(adjustQty, 10);
+    if (isNaN(delta) || delta === 0) return;
     const newStock = Math.max(0, (adjustItem.stock || 0) + delta);
     await db.inventory.update(adjustItem.id!, { stock: newStock, updatedAt: new Date().toISOString() });
-    await logInventoryMovement(adjustItem.sku, 'adjustment', Math.abs(delta), user?.displayName || 'Unknown', {
+    await logInventoryMovement(adjustItem.sku, 'adjustment', Math.abs(delta), user?.displayName || 'Supervisor', {
       note: `${delta > 0 ? '+' : ''}${delta} | ${adjustReason || 'Manual adjustment'}`,
     });
     await logAction('INVENTORY_ADJUST', `Adjusted ${adjustItem.sku} by ${delta}: ${adjustReason}`, user?.displayName || 'Unknown');
@@ -516,65 +538,97 @@ export default function InventoryHub() {
             </div>
           </div>
 
-          {activeTab === 'all' && (
-            <div className="overflow-x-auto">
-              <table className="w-full">
-                <thead>
-                  <tr className="text-[10px] text-text-secondary uppercase tracking-widest border-b border-white/[0.06]">
-                    <th className="text-left py-2 px-2">SKU</th>
-                    <th className="text-left py-2 px-2">Product</th>
-                    <th className="text-center py-2 px-2">Stock</th>
-                    <th className="text-center py-2 px-2">ABC</th>
-                    <th className="text-center py-2 px-2">Location</th>
-                    <th className="text-center py-2 px-2">Velocity</th>
-                    <th className="text-center py-2 px-2">Value</th>
-                    <th className="text-center py-2 px-2">Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {filteredInventory.map((item) => {
-                    const low = isLowStock(item);
-                    const abc = getABCClass(item);
-                    const itemValue = (item.costPerUnit || 0) * (item.stock || 0);
-                    return (
-                      <tr key={item.id} className={`border-b border-white/[0.04] transition-colors ${low ? 'animate-pulse-red' : 'hover:bg-white/[0.02]'}`}>
-                        <td className="py-2 px-2 text-xs font-mono text-text-primary">
-                          <div>{item.sku}</div>
-                          {item.barcode && <div className="text-[9px] text-text-secondary flex items-center gap-0.5"><Barcode className="w-2.5 h-2.5" />{item.barcode}</div>}
-                        </td>
-                        <td className="py-2 px-2 text-xs text-text-primary max-w-[120px] truncate">
-                          <div>{item.product}</div>
-                          {item.category && <div className="text-[9px] text-text-secondary">{item.category}</div>}
-                        </td>
-                        <td className="py-2 px-2 text-center">
-                          {editingId === item.id ? (
-                            <input type="number" value={editStock} onChange={(e) => setEditStock(e.target.value)} onBlur={() => handleStockUpdate(item.id!)} onKeyDown={(e) => e.key === 'Enter' && handleStockUpdate(item.id!)}
-                              className="w-14 bg-transparent border-b border-accent-sky text-center text-xs text-text-primary font-mono focus:outline-none" autoFocus />
-                          ) : (
-                            <button onClick={() => { setEditingId(item.id!); setEditStock(String(item.stock || 0)); }} className={`text-xs font-mono font-semibold ${low ? 'text-accent-red' : 'text-text-primary'}`}>{item.stock}</button>
-                          )}
-                        </td>
-                        <td className="py-2 px-2 text-center">
-                          <span className={`text-[10px] font-bold ${getABCColor(abc)}`}>{abc}</span>
-                        </td>
-                        <td className="py-2 px-2 text-center text-[10px] font-mono text-text-secondary">{item.location}</td>
-                        <td className="py-2 px-2 text-center">
-                          <span className={`text-[9px] font-semibold capitalize ${VELOCITY_COLORS[item.velocity || 'low']}`}>{item.velocity || 'low'}</span>
-                        </td>
-                        <td className="py-2 px-2 text-center text-[10px] font-mono text-accent-green">${itemValue.toLocaleString()}</td>
-                        <td className="py-2 px-2 text-center">
-                          <div className="flex items-center justify-center gap-1">
-                            <button onClick={() => setDetailItem(item)} className="p-1 text-text-secondary hover:text-accent-sky transition-colors" title="Traceability"><History className="w-3 h-3" /></button>
-                            <button onClick={() => setAdjustItem(item)} className="p-1 text-text-secondary hover:text-accent-yellow transition-colors" title="Adjust"><Plus className="w-3 h-3" /></button>
-                          </div>
-                        </td>
+          {activeTab === 'all' && (() => {
+            const totalRows = filteredInventory.length;
+            const startIdx = Math.max(0, Math.floor(tableScrollTop / ROW_HEIGHT) - 6);
+            const visibleCount = Math.ceil(VIEWPORT_HEIGHT / ROW_HEIGHT) + 12;
+            const endIdx = Math.min(totalRows, startIdx + visibleCount);
+            const topPad = startIdx * ROW_HEIGHT;
+            const bottomPad = Math.max(0, (totalRows - endIdx) * ROW_HEIGHT);
+            const slice = filteredInventory.slice(startIdx, endIdx);
+
+            return (
+              <div
+                className="overflow-auto max-h-[480px]"
+                onScroll={(e) => setTableScrollTop(e.currentTarget.scrollTop)}
+              >
+                <table className="w-full">
+                  <thead className="sticky top-0 bg-[#0d0d12] z-10">
+                    <tr className="text-[10px] text-text-secondary uppercase tracking-widest border-b border-white/[0.06]">
+                      <th className="text-left py-2 px-2">SKU</th>
+                      <th className="text-left py-2 px-2">Product</th>
+                      <th className="text-center py-2 px-2">Stock</th>
+                      <th className="text-center py-2 px-2">ABC</th>
+                      <th className="text-center py-2 px-2">Location</th>
+                      <th className="text-center py-2 px-2">Velocity</th>
+                      <th className="text-center py-2 px-2">Value</th>
+                      <th className="text-center py-2 px-2">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {topPad > 0 && (
+                      <tr style={{ height: topPad }}>
+                        <td colSpan={8} />
                       </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          )}
+                    )}
+                    {slice.map((item) => {
+                      const low = isLowStock(item);
+                      const abc = getABCClass(item);
+                      const itemValue = (item.costPerUnit || 0) * (item.stock || 0);
+                      return (
+                        <tr key={item.id ?? item.sku} style={{ height: ROW_HEIGHT }} className={`border-b border-white/[0.04] transition-colors ${low ? 'animate-pulse-red' : 'hover:bg-white/[0.02]'}`}>
+                          <td className="py-2 px-2 text-xs font-mono text-text-primary">
+                            <div>{item.sku}</div>
+                            {item.barcode && <div className="text-[9px] text-text-secondary flex items-center gap-0.5"><Barcode className="w-2.5 h-2.5" />{item.barcode}</div>}
+                          </td>
+                          <td className="py-2 px-2 text-xs text-text-primary max-w-[120px] truncate">
+                            <div>{item.product}</div>
+                            {item.category && <div className="text-[9px] text-text-secondary">{item.category}</div>}
+                          </td>
+                          <td className="py-2 px-2 text-center">
+                            {editingId === item.id && canAdjustStock ? (
+                              <input type="number" value={editStock} onChange={(e) => setEditStock(e.target.value)} onBlur={() => handleStockUpdate(item.id!)} onKeyDown={(e) => e.key === 'Enter' && handleStockUpdate(item.id!)}
+                                className="w-14 bg-transparent border-b border-accent-sky text-center text-xs text-text-primary font-mono focus:outline-none" autoFocus />
+                            ) : (
+                              <button
+                                type="button"
+                                disabled={!canAdjustStock}
+                                onClick={() => { if (canAdjustStock) { setEditingId(item.id!); setEditStock(String(item.stock || 0)); } }}
+                                className={`text-xs font-mono font-semibold ${low ? 'text-accent-red' : 'text-text-primary'} ${!canAdjustStock ? 'cursor-default' : ''}`}
+                              >
+                                {item.stock}
+                              </button>
+                            )}
+                          </td>
+                          <td className="py-2 px-2 text-center">
+                            <span className={`text-[10px] font-bold ${getABCColor(abc)}`}>{abc}</span>
+                          </td>
+                          <td className="py-2 px-2 text-center text-[10px] font-mono text-text-secondary">{item.location}</td>
+                          <td className="py-2 px-2 text-center">
+                            <span className={`text-[9px] font-semibold capitalize ${VELOCITY_COLORS[item.velocity || 'low']}`}>{item.velocity || 'low'}</span>
+                          </td>
+                          <td className="py-2 px-2 text-center text-[10px] font-mono text-accent-green">${itemValue.toLocaleString()}</td>
+                          <td className="py-2 px-2 text-center">
+                            <div className="flex items-center justify-center gap-1">
+                              <button onClick={() => setDetailItem(item)} className="p-1 text-text-secondary hover:text-accent-sky transition-colors" title="Traceability"><History className="w-3 h-3" /></button>
+                              {canAdjustStock && (
+                                <button onClick={() => setAdjustItem(item)} className="p-1 text-text-secondary hover:text-accent-yellow transition-colors" title="Adjust Stock (Supervisor/Admin)"><Plus className="w-3 h-3" /></button>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                    {bottomPad > 0 && (
+                      <tr style={{ height: bottomPad }}>
+                        <td colSpan={8} />
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            );
+          })()}
 
           {activeTab === 'traceability' && (
             <div className="overflow-x-auto">

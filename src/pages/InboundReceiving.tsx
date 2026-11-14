@@ -1,7 +1,8 @@
 import { useState, useCallback, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { db, logAction, logInventoryMovement } from '@/lib/db';
-import { enqueueCloudOperation } from '@/lib/supabaseSync';
+import { db, logAction } from '@/lib/db';
+import { safeLocalStorage } from '@/lib/safeStorage';
+import { receiveInboundTransactional } from '@/lib/lifecycle';
 import { useAuth } from '@/lib/auth';
 import BarcodeReader from '@/components/BarcodeReader';
 import { Package, Plus, History, ArrowRight, AlertTriangle, ShieldCheck, FileSpreadsheet, Upload, CheckCircle, ClipboardList, Sheet } from 'lucide-react';
@@ -133,7 +134,7 @@ export default function InboundReceiving() {
 
   const [gSheetLinks, setGSheetLinks] = useState<{ clientName: string; url: string; addedAt: string }[]>(() => {
     try {
-      const saved = localStorage.getItem('vortex_g_sheet_links');
+      const saved = safeLocalStorage.getItem('vortex_g_sheet_links');
       return saved ? JSON.parse(saved) : [];
     } catch { return []; }
   });
@@ -153,7 +154,7 @@ export default function InboundReceiving() {
   }, [loadRecent]);
 
   useEffect(() => {
-    localStorage.setItem('vortex_g_sheet_links', JSON.stringify(gSheetLinks));
+    safeLocalStorage.setItem('vortex_g_sheet_links', JSON.stringify(gSheetLinks));
   }, [gSheetLinks]);
 
   const handleAddGSheet = () => {
@@ -181,67 +182,29 @@ export default function InboundReceiving() {
     setScanMode(false);
   };
 
-  const processReceive = async (rSku: string, rQty: number, rDesc: string, rBin: string, opts?: { lot?: string; expiry?: string; crossDock?: string; qc?: 'pending' | 'passed' | 'failed' }) => {
-    const existing = await db.inventory.where({ sku: rSku.trim() }).first();
-    const finalBin = rBin.trim() || (existing?.location) || 'UNASSIGNED';
-
-    if (opts?.crossDock?.trim()) {
-      const existingOrder = await db.orders.where({ orderId: opts.crossDock.trim() }).first();
-      if (!existingOrder) {
-        await db.orders.add({
-          orderId: opts.crossDock.trim(),
-          status: 'CrossDock',
-          requiredSkus: rSku.trim(),
-          priority: 'high',
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-        });
-      }
-    }
-
-    if (existing) {
-      await db.inventory.update(existing.id!, {
-        stock: (existing.stock || 0) + rQty,
-        location: finalBin,
-        updatedAt: new Date().toISOString(),
-      });
-    } else {
-      await db.inventory.add({
-        sku: rSku.trim(),
-        product: rDesc || 'Unknown Product',
-        stock: rQty,
-        location: finalBin,
-        updatedAt: new Date().toISOString(),
-      });
-    }
-
-    await db.inbound.add({
+  const processReceive = async (
+    rSku: string,
+    rQty: number,
+    rDesc: string,
+    rBin: string,
+    opts?: { lot?: string; expiry?: string; crossDock?: string; qc?: 'pending' | 'passed' | 'failed'; poNumber?: string; supplier?: string }
+  ) => {
+    const suggested = rBin.trim() || (await suggestPutaway(rSku.trim()));
+    return receiveInboundTransactional({
       sku: rSku.trim(),
       qty: rQty,
-      bin: finalBin,
-      description: rDesc || 'Unknown Product',
+      description: rDesc || undefined,
+      receivingBin: 'RECV-DOCK-01',
+      suggestedLocation: suggested !== 'UNASSIGNED' ? suggested : 'PHONE-A-01',
       lotNumber: opts?.lot?.trim() || undefined,
       expiryDate: opts?.expiry || undefined,
-      receivedAt: new Date().toISOString(),
       crossDockOrderId: opts?.crossDock?.trim() || undefined,
-      qcStatus: opts?.qc || 'passed',
-    });
-
-    await logInventoryMovement(rSku.trim(), 'inbound', rQty, user?.displayName || 'Unknown', {
-      toLocation: finalBin,
-      lotNumber: opts?.lot?.trim() || undefined,
-      note: opts?.crossDock?.trim() ? `Cross-dock for ${opts.crossDock}` : `Inbound receipt`,
-    });
-
-    void enqueueCloudOperation('inbound_grn', {
-      sku: rSku.trim(),
-      qty: rQty,
-      description: rDesc || null,
-      bin: finalBin,
-      lotNumber: opts?.lot?.trim() || 'DEFAULT',
+      poNumber: opts?.poNumber,
+      supplier: opts?.supplier,
       qcStatus: opts?.qc || 'passed',
       operator: user?.displayName || 'Operator',
-    }).catch(() => {});
+      operatorRole: user?.role || 'operator',
+    });
   };
 
   const handleReceive = async () => {
@@ -250,15 +213,23 @@ export default function InboundReceiving() {
       return;
     }
     try {
-      await processReceive(sku.trim(), qty, description, bin, {
-        lot: lotNumber, expiry: expiryDate, crossDock: crossDockOrderId, qc: qcMode ? qcStatus : 'passed',
+      const outcome = await processReceive(sku.trim(), qty, description, bin, {
+        lot: lotNumber,
+        expiry: expiryDate,
+        crossDock: crossDockOrderId,
+        qc: qcMode ? qcStatus : 'passed',
       });
-      await logAction('INBOUND_RECEIVE', `Received ${qty}x ${sku} to ${bin || 'UNASSIGNED'}`, user?.displayName || 'Unknown');
-      setMessage({ type: 'success', text: `Updated ${sku}: +${qty} units` });
+      setMessage({
+        type: outcome.stage === 'qc_hold' ? 'warning' : 'success',
+        text:
+          outcome.stage === 'qc_hold'
+            ? `${outcome.grnRef}: ${qty}× ${sku} routed to QC Inspection Hold before Putaway.`
+            : `${outcome.grnRef}: ${qty}× ${sku} staged → Directed Putaway Task ${outcome.putawayTaskId} (${outcome.suggestedLocation}).`,
+      });
       setSku(''); setQty(1); setBin(''); setDescription(''); setLotNumber(''); setExpiryDate(''); setCrossDockOrderId(''); setQcStatus('pending');
       loadRecent();
-    } catch {
-      setMessage({ type: 'error', text: 'Failed to receive inventory' });
+    } catch (err) {
+      setMessage({ type: 'error', text: err instanceof Error ? err.message : 'Failed to receive inventory' });
     }
   };
 

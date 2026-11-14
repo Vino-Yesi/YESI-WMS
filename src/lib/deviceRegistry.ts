@@ -1,11 +1,12 @@
 import { db, type ConnectedDevice } from './db';
+import { safeLocalStorage, safeRandomId } from './safeStorage';
 
 export function getDeviceId(): string {
   const key = 'vortex_device_id';
-  let id = localStorage.getItem(key);
+  let id = safeLocalStorage.getItem(key);
   if (!id) {
-    id = `DEV-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
-    localStorage.setItem(key, id);
+    id = `DEV-${safeRandomId().slice(0, 8).toUpperCase()}`;
+    safeLocalStorage.setItem(key, id);
   }
   return id;
 }

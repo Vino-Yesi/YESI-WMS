@@ -27,6 +27,19 @@ const TYPE_COLORS = {
   info: 'text-accent-sky',
 };
 
+function LiveClock() {
+  const [currentTime, setCurrentTime] = useState(() => new Date());
+  useEffect(() => {
+    const timer = setInterval(() => setCurrentTime(new Date()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+  return (
+    <div className="text-[11px] text-text-secondary font-mono hidden sm:block tabular-nums">
+      {currentTime.toLocaleTimeString()}
+    </div>
+  );
+}
+
 export default function TopBar({ onMenuToggle, sidebarWidth = 220 }: TopBarProps) {
   const { user, isAdmin } = useAuth();
   const notifications = useAppStore((s) => s.notifications);
@@ -39,7 +52,6 @@ export default function TopBar({ onMenuToggle, sidebarWidth = 220 }: TopBarProps
   const [isOnline, setIsOnline] = useState(() =>
     typeof navigator !== 'undefined' ? navigator.onLine : true
   );
-  const [currentTime, setCurrentTime] = useState(() => new Date());
   const [showNotifs, setShowNotifs] = useState(false);
   const [stats, setStats] = useState<OperatorStats | null>(null);
   const [showStats, setShowStats] = useState(false);
@@ -53,11 +65,9 @@ export default function TopBar({ onMenuToggle, sidebarWidth = 220 }: TopBarProps
     const handleOffline = () => setIsOnline(false);
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
-    const timer = setInterval(() => setCurrentTime(new Date()), 1000);
     return () => {
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
-      clearInterval(timer);
     };
   }, []);
 
@@ -123,9 +133,7 @@ export default function TopBar({ onMenuToggle, sidebarWidth = 220 }: TopBarProps
       </div>
 
       <div className="flex items-center gap-2 lg:gap-3">
-        <div className="text-[11px] text-text-secondary font-mono hidden sm:block tabular-nums">
-          {currentTime.toLocaleTimeString()}
-        </div>
+        <LiveClock />
 
         <button
           onClick={toggleDensity}

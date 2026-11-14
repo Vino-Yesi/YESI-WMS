@@ -1,6 +1,6 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { db } from '@/lib/db';
+import { db, type InventoryMovement } from '@/lib/db';
 import { useAppStore } from '@/lib/store';
 import KineticCounter from '@/components/KineticCounter';
 import StatusBadge from '@/components/StatusBadge';
@@ -48,93 +48,117 @@ export default function Dashboard() {
   });
   const [recentOrders, setRecentOrders] = useState<Order[]>([]);
   const [lowStockItems, setLowStockItems] = useState<InventoryItem[]>([]);
-  const [recentMovements, setRecentMovements] = useState<any[]>([]);
+  const [recentMovements, setRecentMovements] = useState<InventoryMovement[]>([]);
   const [forecastAlerts, setForecastAlerts] = useState<ForecastAlert[]>([]);
   const [lastRefresh, setLastRefresh] = useState<string>('');
   const [refreshing, setRefreshing] = useState(false);
 
   const loadStats = useCallback(async () => {
     setRefreshing(true);
-    const inventory = await db.inventory.toArray();
-    const orders = await db.orders.toArray();
-    const returns = await db.returns.toArray();
-    const qcHolds = await db.qcHolds.toArray();
-    const counts = await db.cycleCounts.toArray();
-    const postings = await db.postingRecords.toArray();
-    const waves = await db.waveBatches.toArray();
-    const tasks = await db.workerTasks.toArray();
-    const movements = await db.inventoryMovements.toArray();
+    try {
+      // Parallel indexed/bounded queries instead of 9 sequential full-table scans
+      const [
+        inventory,
+        orders,
+        returnsCount,
+        qcHoldsCount,
+        pendingCounts,
+        postingCount,
+        waveActive,
+        workerTasksActive,
+        movements,
+      ] = await Promise.all([
+        db.inventory.toArray(),
+        db.orders.toArray(),
+        db.returns.count(),
+        db.qcHolds.where('status').equals('hold').count(),
+        db.cycleCounts.where('status').equals('pending').count(),
+        db.postingRecords.count(),
+        db.waveBatches.where('status').anyOf(['open', 'picking']).count(),
+        db.workerTasks.where('status').equals('in_progress').count(),
+        db.inventoryMovements.reverse().limit(5).toArray(),
+      ]);
 
-    const totalStock = inventory.reduce((sum, item) => sum + (item.stock || 0), 0);
-    const lowStock = inventory.filter(item => (item.stock || 0) < (item.reorderPoint || 10));
-    const pending = orders.filter(o => o.status === 'Pending');
-    const shipped = orders.filter(o => o.status === 'Shipped');
-    const reorderAlerts = inventory.filter(item => item.reorderPoint && (item.stock || 0) <= item.reorderPoint);
-    const totalShippable = pending.length + shipped.length;
+      const totalStock = inventory.reduce((sum, item) => sum + (item.stock || 0), 0);
+      const lowStock = inventory.filter((item) => (item.stock || 0) < (item.reorderPoint || 10));
+      const pending = orders.filter((o) => o.status === 'Pending' || o.status === 'Picking');
+      const shipped = orders.filter((o) => o.status === 'Shipped');
+      const reorderAlerts = inventory.filter((item) => item.reorderPoint && (item.stock || 0) <= item.reorderPoint);
+      const totalShippable = pending.length + shipped.length;
 
-    // Forecast days until stockout based on velocity
-    const velocityMultiplier = { high: 8, medium: 4, low: 1 } as const;
-    const forecast = inventory
-      .map(item => {
-        const vel = (item.velocity || 'low') as keyof typeof velocityMultiplier;
-        const dailyBurn = velocityMultiplier[vel] || 1;
-        const days = item.stock > 0 ? Math.floor(item.stock / dailyBurn) : 0;
-        return { sku: item.sku, product: item.product, stock: item.stock, velocity: item.velocity || 'low', daysUntilStockout: days };
-      })
-      .filter(f => f.daysUntilStockout <= 7 && f.daysUntilStockout > 0)
-      .sort((a, b) => a.daysUntilStockout - b.daysUntilStockout)
-      .slice(0, 5);
+      const velocityMultiplier = { high: 8, medium: 4, low: 1 } as const;
+      const forecast = inventory
+        .map((item) => {
+          const vel = (item.velocity || 'low') as keyof typeof velocityMultiplier;
+          const dailyBurn = velocityMultiplier[vel] || 1;
+          const days = item.stock > 0 ? Math.floor(item.stock / dailyBurn) : 0;
+          return { sku: item.sku, product: item.product, stock: item.stock, velocity: item.velocity || 'low', daysUntilStockout: days };
+        })
+        .filter((f) => f.daysUntilStockout <= 7 && f.daysUntilStockout > 0)
+        .sort((a, b) => a.daysUntilStockout - b.daysUntilStockout)
+        .slice(0, 5);
 
-    setStats({
-      totalStock,
-      lowStock: lowStock.length,
-      pendingOrders: pending.length,
-      shippedToday: shipped.length,
-      totalReturns: returns.length,
-      totalSkus: inventory.length,
-      qcHolds: qcHolds.filter(h => h.status === 'hold').length,
-      pendingCounts: counts.filter(c => c.status === 'pending').length,
-      reorderAlerts: reorderAlerts.length,
-      postingCount: postings.length,
-      waveActive: waves.filter(w => w.status === 'open' || w.status === 'picking').length,
-      workerTasksActive: tasks.filter(t => t.status === 'in_progress').length,
-      avgFulfillmentRate: totalShippable > 0 ? (shipped.length / totalShippable) * 100 : 0,
-    });
+      setStats({
+        totalStock,
+        lowStock: lowStock.length,
+        pendingOrders: pending.length,
+        shippedToday: shipped.length,
+        totalReturns: returnsCount,
+        totalSkus: inventory.length,
+        qcHolds: qcHoldsCount,
+        pendingCounts,
+        reorderAlerts: reorderAlerts.length,
+        postingCount,
+        waveActive,
+        workerTasksActive,
+        avgFulfillmentRate: totalShippable > 0 ? (shipped.length / totalShippable) * 100 : 0,
+      });
 
-    setRecentOrders(orders.slice(-5).reverse());
-    setLowStockItems(lowStock.slice(0, 5));
-    setRecentMovements(movements.reverse().slice(0, 5));
-    setForecastAlerts(forecast);
-    setLastRefresh(new Date().toLocaleTimeString());
-    setRefreshing(false);
+      setRecentOrders(orders.slice(-5).reverse());
+      setLowStockItems(lowStock.slice(0, 5));
+      setRecentMovements(movements);
+      setForecastAlerts(forecast);
+      setLastRefresh(new Date().toLocaleTimeString());
+    } finally {
+      setRefreshing(false);
+    }
   }, []);
 
   useEffect(() => {
-    loadStats();
+    void loadStats();
   }, [loadStats]);
 
-  // Auto-refresh
+  // Throttled auto-refresh (minimum 45s, paused when tab is hidden)
   useEffect(() => {
     if (!autoRefresh) return;
+    const intervalMs = Math.max(45, refreshInterval || 45) * 1000;
     const interval = setInterval(() => {
-      loadStats();
-    }, (refreshInterval || 30) * 1000);
+      if (typeof document === 'undefined' || document.visibilityState === 'visible') {
+        void loadStats();
+      }
+    }, intervalMs);
     return () => clearInterval(interval);
   }, [autoRefresh, refreshInterval, loadStats]);
 
-  const kpiCards = [
-    { label: 'Total Items', value: stats.totalStock, icon: Box, color: 'text-accent-sky', delay: 0 },
-    { label: 'Low Stock', value: stats.lowStock, icon: AlertTriangle, color: 'text-accent-red', alert: true, delay: 0.05 },
-    { label: 'Pending Orders', value: stats.pendingOrders, icon: Clock, color: 'text-accent-yellow', delay: 0.1 },
-    { label: 'Shipped', value: stats.shippedToday, icon: CheckCircle, color: 'text-accent-green', delay: 0.15 },
-  ];
+  const kpiCards = useMemo(
+    () => [
+      { label: 'Total Items', value: stats.totalStock, icon: Box, color: 'text-accent-sky', delay: 0 },
+      { label: 'Low Stock', value: stats.lowStock, icon: AlertTriangle, color: 'text-accent-red', alert: true, delay: 0.05 },
+      { label: 'Pending Orders', value: stats.pendingOrders, icon: Clock, color: 'text-accent-yellow', delay: 0.1 },
+      { label: 'Shipped', value: stats.shippedToday, icon: CheckCircle, color: 'text-accent-green', delay: 0.15 },
+    ],
+    [stats.totalStock, stats.lowStock, stats.pendingOrders, stats.shippedToday]
+  );
 
-  const quickLinks = [
-    { label: 'Analytics', icon: BarChart3, path: '/analytics', color: 'text-accent-sky', desc: 'View warehouse KPIs' },
-    { label: 'Replenishment', icon: Zap, path: '/replenishment', color: 'text-accent-yellow', desc: `${stats.reorderAlerts} reorder alerts` },
-    { label: 'QC Management', icon: ShieldCheck, path: '/qc', color: 'text-accent-red', desc: `${stats.qcHolds} active holds` },
-    { label: 'Cycle Count', icon: ClipboardCheck, path: '/cycle-count', color: 'text-accent-green', desc: `${stats.pendingCounts} pending counts` },
-  ];
+  const quickLinks = useMemo(
+    () => [
+      { label: 'Analytics', icon: BarChart3, path: '/analytics', color: 'text-accent-sky', desc: 'View warehouse KPIs' },
+      { label: 'Replenishment', icon: Zap, path: '/replenishment', color: 'text-accent-yellow', desc: `${stats.reorderAlerts} reorder alerts` },
+      { label: 'QC Management', icon: ShieldCheck, path: '/qc', color: 'text-accent-red', desc: `${stats.qcHolds} active holds` },
+      { label: 'Cycle Count', icon: ClipboardCheck, path: '/cycle-count', color: 'text-accent-green', desc: `${stats.pendingCounts} pending counts` },
+    ],
+    [stats.reorderAlerts, stats.qcHolds, stats.pendingCounts]
+  );
 
   const unreadNotifications = notifications.filter(n => !n.read).length;
   const recentNotifications = notifications.slice(0, 5);

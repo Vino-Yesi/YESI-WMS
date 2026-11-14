@@ -13,6 +13,15 @@ interface State {
   errorInfo: ErrorInfo | null;
 }
 
+function formatThrownError(error: Error | null): string {
+  if (!error) return 'Unknown runtime exception';
+  const name = error.name && error.name !== 'Error' ? `${error.name}: ` : '';
+  const msg = (error.message || '').trim();
+  if (msg) return `${name}${msg}`;
+  if (error.name) return `${error.name} (browser security or storage exception with empty message)`;
+  return String(error);
+}
+
 export class ErrorBoundary extends Component<Props, State> {
   state: State = { hasError: false, error: null, errorInfo: null };
 
@@ -26,18 +35,34 @@ export class ErrorBoundary extends Component<Props, State> {
   }
 
   handleReset = () => {
+    const msg = (this.state.error?.message || '').toLowerCase();
+    // Auto-recover stale Vite/PWA lazy chunk mismatches via clean reload
+    if (
+      msg.includes('dynamically imported module') ||
+      msg.includes('importing a module script failed') ||
+      msg.includes('loading chunk')
+    ) {
+      window.location.reload();
+      return;
+    }
     this.setState({ hasError: false, error: null, errorInfo: null });
     this.props.onReset?.();
   };
 
   handleHome = () => {
     this.setState({ hasError: false, error: null, errorInfo: null });
-    window.location.hash = '#/';
-    window.location.pathname = '/';
+    window.location.assign('/');
   };
 
   render() {
     if (this.state.hasError) {
+      const formattedMessage = formatThrownError(this.state.error);
+      const stackSummary = this.state.errorInfo?.componentStack
+        ?.trim()
+        .split('\n')
+        .slice(0, 3)
+        .join('\n');
+
       return (
         <div className="flex flex-col items-center justify-center py-16 px-4 text-center">
           <div className="w-12 h-12 rounded-full bg-accent-red/15 flex items-center justify-center mb-4">
@@ -49,11 +74,10 @@ export class ErrorBoundary extends Component<Props, State> {
           <p className="text-xs text-text-secondary max-w-md mb-2">
             This page hit an unexpected error. You can retry or return to the dashboard.
           </p>
-          {this.state.error && (
-            <pre className="text-[10px] text-accent-red/80 bg-white/5 border border-white/10 rounded-md px-3 py-2 max-w-lg overflow-auto mb-4 text-left">
-              {this.state.error.message}
-            </pre>
-          )}
+          <pre className="text-[10px] text-accent-red/85 bg-white/5 border border-white/10 rounded-md px-3 py-2 max-w-lg overflow-auto mb-4 text-left whitespace-pre-wrap break-words">
+            {formattedMessage}
+            {stackSummary ? `\n${stackSummary}` : ''}
+          </pre>
           <div className="flex gap-2">
             <button
               onClick={this.handleReset}

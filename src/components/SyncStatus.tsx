@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
 import { getSyncState, subscribeSyncState, pullCloudSnapshotToEdge, type SyncSnapshotState } from '@/lib/supabaseSync';
+import { isSupabaseConfigured } from '@/lib/supabase';
 import { RefreshCw } from 'lucide-react';
 
 interface SyncStatusProps {
@@ -16,6 +17,7 @@ export default function SyncStatus({ isOnline }: SyncStatusProps) {
   }, []);
 
   const syncing = sync.status === 'syncing';
+  const unconfigured = !isSupabaseConfigured || sync.status === 'unconfigured';
 
   return (
     <div className="flex items-center gap-2 text-xs text-text-secondary">
@@ -24,41 +26,57 @@ export default function SyncStatus({ isOnline }: SyncStatusProps) {
           <motion.div
             key={i}
             className={`w-[2px] rounded-full ${
-              !isOnline ? 'bg-accent-red' : sync.status === 'error' ? 'bg-accent-yellow' : 'bg-accent-green'
+              !isOnline
+                ? 'bg-accent-red'
+                : unconfigured
+                  ? 'bg-accent-sky'
+                  : sync.status === 'error'
+                    ? 'bg-accent-yellow'
+                    : 'bg-accent-green'
             }`}
             style={{ height: '100%' }}
-            animate={isOnline ? { scaleY: [0.25, 1, 0.25] } : { scaleY: 0.25 }}
+            animate={isOnline && !unconfigured ? { scaleY: [0.25, 1, 0.25] } : { scaleY: 0.45 }}
             transition={
-              isOnline
-                ? { duration: syncing ? 0.45 : 0.9, repeat: Infinity, delay: i * 0.1, ease: 'easeInOut' }
+              isOnline && !unconfigured
+                ? { duration: syncing ? 0.45 : 1.1, repeat: Infinity, delay: i * 0.1, ease: 'easeInOut' }
                 : {}
             }
           />
         ))}
       </div>
       <span className="uppercase tracking-widest text-[10px] sm:text-[11px] flex items-center gap-1.5">
-        {isOnline ? (
+        {unconfigured ? (
+          <>
+            <span className="text-accent-sky font-semibold">{sync.warehouseCode}</span>
+            <span className="hidden sm:inline text-white/45">• EDGE LOCAL MODE</span>
+          </>
+        ) : isOnline ? (
           <>
             <span className="text-accent-green font-semibold">{sync.warehouseCode}</span>
             <span className="hidden sm:inline text-white/45">
-              • {syncing ? 'SYNCING' : sync.pendingOutbox > 0 ? `OUTBOX (${sync.pendingOutbox})` : 'SUPABASE LIVE'}
+              •{' '}
+              {syncing
+                ? 'SYNCING'
+                : sync.pendingOutbox > 0
+                  ? `OUTBOX (${sync.pendingOutbox})`
+                  : sync.deadLetterCount > 0
+                    ? `DLQ (${sync.deadLetterCount})`
+                    : 'CLOUD SYNCED'}
             </span>
           </>
         ) : (
           <>
             <span className="text-accent-red font-semibold">EDGE OFFLINE</span>
-            <span className="hidden sm:inline text-white/45">
-              • QUEUED ({sync.pendingOutbox})
-            </span>
+            <span className="hidden sm:inline text-white/45">• QUEUED ({sync.pendingOutbox})</span>
           </>
         )}
       </span>
-      {isOnline && (
+      {isOnline && !unconfigured && (
         <button
           type="button"
           onClick={() => void pullCloudSnapshotToEdge()}
           className="p-1 rounded hover:bg-white/5 text-white/40 hover:text-sky-400 transition-colors"
-          title="Sync with Supabase PostgreSQL Core"
+          title="Reconcile with Supabase PostgreSQL Core"
         >
           <RefreshCw className={`w-3 h-3 ${syncing ? 'animate-spin text-sky-400' : ''}`} />
         </button>

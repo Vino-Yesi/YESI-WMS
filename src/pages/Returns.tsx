@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { motion } from 'framer-motion';
-import { db, logAction, logInventoryMovement } from '@/lib/db';
+import { processReturnTransactional } from '@/lib/lifecycle';
 import { useAuth } from '@/lib/auth';
 import BarcodeReader from '@/components/BarcodeReader';
 import { RotateCcw, AlertTriangle, CheckCircle, Minus, Plus } from 'lucide-react';
@@ -38,65 +38,33 @@ export default function Returns() {
 
     try {
       const isDefective = reason === 'Defective/Damaged';
-
-      if (isDefective) {
-        // Add to QC Hold
-        await db.qcHolds.add({
-          sku: sku.trim(),
-          quantity,
-          reason: `Return - ${reason}`,
-          status: 'hold',
-          operator: user?.displayName || 'Unknown',
-          createdAt: new Date().toISOString(),
-        });
-        setMessage({ type: 'warning', text: `Logged ${quantity}x ${sku} as damaged. Item placed on QC Hold.` });
-      } else {
-        const existing = await db.inventory.where({ sku: sku.trim() }).first();
-        if (existing && existing.id) {
-          const newStock = (existing.stock || 0) + quantity;
-          await db.inventory.update(existing.id, {
-            stock: newStock,
-            updatedAt: new Date().toISOString(),
-          });
-          await logInventoryMovement(sku.trim(), 'return', quantity, user?.displayName || 'Unknown', {
-            toLocation: existing.location,
-            note: `Return restock - ${reason}`,
-          });
-          setMessage({ type: 'success', text: `Restocked ${quantity} unit(s) of ${sku}` });
-        } else {
-          setMessage({ type: 'warning', text: `SKU ${sku} not found in inventory. Use Inbound Receiving to create it.` });
-        }
-      }
-
-      // Log the return
-      await db.returns.add({
-        orderId: orderId || 'N/A',
+      const outcome = await processReturnTransactional({
+        orderId: orderId.trim() || undefined,
         sku: sku.trim(),
-        reason,
-        restocked: !isDefective,
         quantity,
-        processedAt: new Date().toISOString(),
+        reason,
+        disposition: isDefective ? 'quarantine' : 'restock',
+        operator: user?.displayName || 'Operator',
+        operatorRole: user?.role || 'operator',
       });
 
-      // Update order status if provided
-      if (orderId.trim()) {
-        const order = await db.orders.where({ orderId: orderId.trim() }).first();
-        if (order && order.id) {
-          await db.orders.update(order.id, { status: 'Returned', updatedAt: new Date().toISOString() });
-          setMessage(prev => ({
-            type: prev?.type || 'success',
-            text: `${prev?.text || ''} Order ${orderId} status updated to 'Returned'.`,
-          }));
-        }
+      if (outcome.routedTo === 'qc_hold') {
+        setMessage({
+          type: 'warning',
+          text: `${outcome.rmaRef}: ${quantity}× ${sku} quarantined in QC Hold for supervisor disposition.`,
+        });
+      } else {
+        setMessage({
+          type: 'success',
+          text: `${outcome.rmaRef}: ${quantity}× ${sku} staged into Directed Putaway Queue for verified bin restock.`,
+        });
       }
-
-      await logAction('RETURN_PROCESSED', `Return processed: ${quantity}x ${sku} - ${reason}`, user?.displayName || 'Unknown');
 
       setSku('');
       setOrderId('');
       setQuantity(1);
-    } catch {
-      setMessage({ type: 'error', text: 'Failed to process return' });
+    } catch (err) {
+      setMessage({ type: 'error', text: err instanceof Error ? err.message : 'Failed to process return' });
     }
   };
 

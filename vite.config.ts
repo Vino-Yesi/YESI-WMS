@@ -14,8 +14,8 @@ const isTauriBuild = !!process.env.TAURI_ENV_PLATFORM || !!process.env.TAURI_ENV
  * caused Rollup cycles (vendor-react <-> vendor-charts / vendor-db).
  * Keep React + Dexie + Recharts in one chunk; isolate only independent heavy vendors.
  */
-export default defineConfig({
-  base: './',
+export default defineConfig(({ command }) => ({
+  base: command === 'serve' ? '/' : './',
   plugins: [
     // inspectAttr(),
     react(),
@@ -100,15 +100,20 @@ export default defineConfig({
     port: 3000,
     strictPort: true,
     allowedHosts: true,
+    cors: true,
   },
   preview: {
     host: '0.0.0.0',
-    port: 4173,
+    port: 3000,
     allowedHosts: true,
+    cors: true,
   },
   envPrefix: ['VITE_', 'TAURI_'],
   clearScreen: false,
-  resolve: { alias: { "@": path.resolve(__dirname, "./src") } },
+  resolve: {
+    alias: { "@": path.resolve(__dirname, "./src") },
+    dedupe: ['react', 'react-dom', 'react-router', 'react-router-dom'],
+  },
   build: {
     target: process.env.TAURI_ENV_PLATFORM === 'windows' ? 'chrome105' : 'safari13',
     minify: !process.env.TAURI_ENV_DEBUG ? 'esbuild' : false,
@@ -138,4 +143,4 @@ export default defineConfig({
       },
     },
   },
-});
+}));

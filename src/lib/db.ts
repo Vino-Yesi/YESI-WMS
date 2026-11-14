@@ -725,12 +725,16 @@ export const db = new VortexDB();
 
 // Audit log helper (writes locally + queues cloud audit trail)
 export async function logAction(action: string, details: string, operator: string) {
-  await db.auditLogs.add({
-    action,
-    details,
-    operator,
-    timestamp: new Date().toISOString(),
-  });
+  try {
+    await db.auditLogs.add({
+      action,
+      details,
+      operator,
+      timestamp: new Date().toISOString(),
+    });
+  } catch {
+    // IndexedDB unavailable in restricted iframe — still attempt cloud audit queue
+  }
   void enqueueCloudOperation('audit_log', { action, details, operator }).catch(() => {});
 }
 

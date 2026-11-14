@@ -1,26 +1,126 @@
-import { describe, it, expect } from 'vitest';
-import { hashPasswordLocal, verifyPasswordLocal, isHashedSecret, hasPermission } from '@/lib/security';
+import { describe, it, expect, vi } from 'vitest';
+
+vi.mock('@/lib/db', () => ({
+  db: {
+    preferences: {
+      where: () => ({ equals: () => ({ first: async () => null }) }),
+      add: async () => 1,
+      update: async () => 1,
+    },
+  },
+}));
+
+import {
+  hashPasswordLocal,
+  verifyPasswordLocal,
+  isHashedSecret,
+  hasPermission,
+  canAccessRoute,
+  canAccessWarehouse,
+  encryptSessionEnvelope,
+  decryptSessionEnvelope,
+} from '@/lib/security';
+import { validateRuntimeConfig } from '@/lib/config';
+import { validateOutboxPayload, computeBackoffMs } from '@/lib/supabaseSync';
 import { validateScan, buildSummary, type ExpectedLine } from '@/lib/scanValidation';
 import { routeOptimizer, oracle, sentinel } from '@/lib/neuralOps';
+import { safeLocalStorage, safeSessionStorage } from '@/lib/safeStorage';
+import { useAppStore } from '@/lib/store';
 
-describe('WMS Security & RBAC', () => {
-  it('hashes passwords with PBKDF2-SHA256 and verifies constant-time', async () => {
+describe('WMS Runtime Config & Secret Guardrails', () => {
+  it('gracefully enters isolated Offline-Edge Mode when cloud env vars are missing', () => {
+    const report = validateRuntimeConfig({});
+    expect(report.cloudEnabled).toBe(false);
+    expect(report.supabaseUrl).toBeNull();
+    expect(report.supabaseAnonKey).toBeNull();
+    expect(report.errors).toHaveLength(0);
+  });
+
+  it('rejects accidental service_role / secret keys in browser configuration', () => {
+    const fakeSecretPrefix = ['sb', 'secret', 'TEST_ONLY_MOCK_KEY_123456'].join('_');
+    const report = validateRuntimeConfig({
+      VITE_SUPABASE_URL: 'https://demo-wms.example-cloud.invalid',
+      VITE_SUPABASE_ANON_KEY: fakeSecretPrefix,
+    });
+    expect(report.cloudEnabled).toBe(false);
+    expect(report.errors.some((e) => e.includes('CRITICAL SECURITY VIOLATION'))).toBe(true);
+  });
+
+  it('rejects non-HTTPS Supabase URLs', () => {
+    const report = validateRuntimeConfig({
+      VITE_SUPABASE_URL: 'http://insecure.local',
+      VITE_SUPABASE_ANON_KEY: 'valid_publishable_token_placeholder_1234567890',
+    });
+    expect(report.cloudEnabled).toBe(false);
+    expect(report.errors.some((e) => e.includes('HTTPS'))).toBe(true);
+  });
+});
+
+describe('WMS Security, AES-GCM Session Envelope & Module RBAC', () => {
+  it('hashes passwords with PBKDF2-SHA256 and strictly rejects unhashed plaintext secrets', async () => {
     const hash = await hashPasswordLocal('VINOVJ-Secure-2026');
     expect(isHashedSecret(hash)).toBe(true);
     expect(hash).not.toContain('VINOVJ-Secure-2026');
 
     expect(await verifyPasswordLocal('VINOVJ-Secure-2026', hash)).toBe(true);
     expect(await verifyPasswordLocal('WrongPassword', hash)).toBe(false);
+    // Plaintext stored password must NEVER pass strict verification
+    expect(await verifyPasswordLocal('plaintext', 'plaintext')).toBe(false);
   });
 
-  it('enforces granular role permissions across admin, supervisor, operator, auditor, viewer', () => {
+  it('encrypts and decrypts session payloads with non-extractable AES-256-GCM', async () => {
+    const session = {
+      user: { username: 'VINOVJ', role: 'admin', tenantCode: 'YESI-FZCO', warehouseCode: 'DXB-FC1' },
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+    const ciphertext = await encryptSessionEnvelope(session);
+    expect(ciphertext.startsWith('aes256gcm.')).toBe(true);
+    expect(ciphertext).not.toContain('VINOVJ');
+
+    const restored = await decryptSessionEnvelope<typeof session>(ciphertext);
+    expect(restored?.user.username).toBe('VINOVJ');
+    expect(await decryptSessionEnvelope('aes256gcm.tampered.payload')).toBeNull();
+  });
+
+  it('enforces granular module route guards and warehouse-level scoping', () => {
     expect(hasPermission('admin', 'users.delete')).toBe(true);
     expect(hasPermission('supervisor', 'qc.release')).toBe(true);
-    expect(hasPermission('supervisor', 'users.delete')).toBe(false);
-    expect(hasPermission('operator', 'outbound.execute')).toBe(true);
+    expect(hasPermission('supervisor', 'users.manage')).toBe(false);
+    expect(hasPermission('operator', 'outbound.pack')).toBe(true);
     expect(hasPermission('operator', 'qc.release')).toBe(false);
-    expect(hasPermission('auditor', 'cycle_count.execute')).toBe(true);
-    expect(hasPermission('viewer', 'inbound.execute')).toBe(false);
+    expect(hasPermission('operator', 'inventory.adjust')).toBe(false);
+
+    expect(canAccessRoute('operator', '/inbound')).toBe(true);
+    expect(canAccessRoute('operator', '/users')).toBe(false);
+    expect(canAccessRoute('operator', '/integrations')).toBe(false);
+    expect(canAccessRoute('supervisor', '/integrations')).toBe(true);
+    expect(canAccessRoute('viewer', '/pick-pack')).toBe(false);
+
+    expect(canAccessWarehouse('operator', ['DXB-FC1'], 'DXB-FC1')).toBe(true);
+    expect(canAccessWarehouse('operator', ['DXB-FC1'], 'MSK-HUB2')).toBe(false);
+    expect(canAccessWarehouse('admin', ['DXB-FC1'], 'MSK-HUB2')).toBe(true);
+  });
+});
+
+describe('WMS Transactional Outbox Validation & Retry Backoff', () => {
+  it('rejects malformed outbox payloads and accepts valid lifecycle events', () => {
+    expect(validateOutboxPayload('inbound_grn', { sku: '', qty: 5 }).valid).toBe(false);
+    expect(validateOutboxPayload('inbound_grn', { sku: 'A17Black256', qty: -2 }).valid).toBe(false);
+    expect(validateOutboxPayload('inbound_grn', { sku: 'A17Black256', qty: 5 }).valid).toBe(true);
+
+    expect(validateOutboxPayload('qc_release', { sku: 'A17', qty: 2, disposition: 'invalid' }).valid).toBe(false);
+    expect(validateOutboxPayload('qc_release', { sku: 'A17', qty: 2, disposition: 'release' }).valid).toBe(true);
+
+    expect(validateOutboxPayload('dispatch_order', {}).valid).toBe(false);
+    expect(validateOutboxPayload('dispatch_order', { orderId: 'ORD-1001' }).valid).toBe(true);
+  });
+
+  it('computes exponential backoff with bounded ceiling', () => {
+    const b1 = computeBackoffMs(1);
+    const b4 = computeBackoffMs(4);
+    expect(b1).toBeGreaterThanOrEqual(1500);
+    expect(b4).toBeGreaterThan(b1);
+    expect(computeBackoffMs(20)).toBeLessThanOrEqual(301_000);
   });
 });
 
@@ -86,5 +186,36 @@ describe('WMS Quantum Route Optimizer, Oracle Forecast & Anomaly Sentinel', () =
       [{ status: 'Open' }]
     );
     expect(alerts.some((a) => a.sku === 'SKU-NEG')).toBe(true);
+  });
+});
+
+describe('Sandboxed Iframe Storage Resilience (safeStorage & Zustand Persist)', () => {
+  it('never throws SecurityError when localStorage / sessionStorage are blocked in cross-origin iframes', () => {
+    const throwingStorage: Storage = {
+      length: 0,
+      clear() { throw new DOMException('', 'SecurityError'); },
+      getItem() { throw new DOMException('', 'SecurityError'); },
+      key() { throw new DOMException('', 'SecurityError'); },
+      removeItem() { throw new DOMException('', 'SecurityError'); },
+      setItem() { throw new DOMException('', 'SecurityError'); },
+    };
+
+    vi.stubGlobal('window', {
+      localStorage: throwingStorage,
+      sessionStorage: throwingStorage,
+    });
+
+    expect(() => safeLocalStorage.setItem('test_k', 'v1')).not.toThrow();
+    expect(safeLocalStorage.getItem('test_k')).toBe('v1');
+    expect(() => safeSessionStorage.setItem('sess_k', 's1')).not.toThrow();
+    expect(safeSessionStorage.getItem('sess_k')).toBe('s1');
+
+    // Mutating Zustand store actions under blocked Web Storage must never throw or crash React
+    expect(() => useAppStore.getState().setAiAssistantOpen(true)).not.toThrow();
+    expect(useAppStore.getState().aiAssistantOpen).toBe(true);
+    expect(() => useAppStore.getState().setDensity('comfortable')).not.toThrow();
+    expect(useAppStore.getState().density).toBe('comfortable');
+
+    vi.unstubAllGlobals();
   });
 });

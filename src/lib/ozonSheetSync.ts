@@ -3,7 +3,7 @@ import { fetchSheet, parseUploadedFile, type SheetFetchOptions } from './googleS
 import { mapRowsToOzonOrders, toDbOrder, detectColumnMapping } from './ozonSheetMapper';
 import type { SheetSyncConfig, SheetSyncLog } from './db';
 import { autoAllocatePendingOrders } from './allocation';
-import { registerDeviceHeartbeat } from './deviceRegistry';
+import { registerDeviceHeartbeat, getDeviceId } from './deviceRegistry';
 
 export interface SyncResult {
   imported: number;
@@ -151,7 +151,7 @@ async function logSync(
     recordsProcessed,
     totalRows,
     operator,
-    deviceId: localStorage.getItem('vortex_device_id') || 'unknown',
+    deviceId: getDeviceId() || 'unknown',
     durationMs,
     createdAt: new Date().toISOString(),
   });

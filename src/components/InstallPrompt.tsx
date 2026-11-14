@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Download, X, Share, PlusSquare, Smartphone } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { safeMatchMedia, safeSessionStorage } from '@/lib/safeStorage';
 
 type Platform = 'ios' | 'android' | 'desktop' | 'standalone' | 'tauri';
 
@@ -18,8 +19,8 @@ function detectPlatform(): Platform {
   // Already running as installed PWA / home-screen app
   if (
     nav.standalone === true ||
-    window.matchMedia('(display-mode: standalone)').matches ||
-    window.matchMedia('(display-mode: minimal-ui)').matches
+    safeMatchMedia('(display-mode: standalone)') ||
+    safeMatchMedia('(display-mode: minimal-ui)')
   ) {
     return 'standalone';
   }
@@ -49,11 +50,7 @@ export default function InstallPrompt() {
     const p = platform;
     if (p === 'standalone' || p === 'tauri') return;
 
-    try {
-      if (sessionStorage.getItem(DISMISS_KEY) === '1') return;
-    } catch {
-      /* ignore */
-    }
+    if (safeSessionStorage.getItem(DISMISS_KEY) === '1') return;
 
     // Chrome / Edge / Android: native install prompt
     const onBip = (e: Event) => {
@@ -84,11 +81,7 @@ export default function InstallPrompt() {
   const dismiss = useCallback(() => {
     setShowPrompt(false);
     setShowIosGuide(false);
-    try {
-      sessionStorage.setItem(DISMISS_KEY, '1');
-    } catch {
-      /* ignore */
-    }
+    safeSessionStorage.setItem(DISMISS_KEY, '1');
   }, []);
 
   const handleInstallClick = async () => {

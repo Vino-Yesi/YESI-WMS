@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { db, logAction, logInventoryMovement } from '@/lib/db';
+import { db } from '@/lib/db';
+import { confirmPickAndPackTransactional } from '@/lib/lifecycle';
 import { useAuth } from '@/lib/auth';
 import BarcodeReader from '@/components/BarcodeReader';
 import StatusBadge from '@/components/StatusBadge';
@@ -38,7 +39,7 @@ export default function PickPack() {
     loadData();
   }, [loadData]);
 
-  const pendingOrders = orders.filter(o => o.status === 'Pending');
+  const pendingOrders = orders.filter(o => o.status === 'Pending' || o.status === 'Picking');
 
   const getRequiredItems = (order: Order): RequiredItem[] => {
     const skus = order.requiredSkus.split(',').map(s => s.trim()).filter(Boolean);
@@ -127,7 +128,7 @@ export default function PickPack() {
   };
 
   const handleVerifyAndShip = async () => {
-    if (!selectedOrder) return;
+    if (!selectedOrder || !selectedOrder.id) return;
     const items = getRequiredItems(selectedOrder);
     const allPicked = items.every(req => {
       const picked = requiredItems.find(r => r.sku === req.sku)?.picked || 0;
@@ -142,32 +143,23 @@ export default function PickPack() {
       return;
     }
 
-    // Update order status
-    await db.orders.update(selectedOrder.id!, { status: 'Shipped', updatedAt: new Date().toISOString(), assignedTo: user?.displayName || 'Unknown' });
-
-    // Deduct inventory for each picked quantity
-    for (const req of requiredItems) {
-      const item = await db.inventory.where({ sku: req.sku }).first();
-      if (item && item.id) {
-        const newStock = Math.max(0, (item.stock || 0) - req.picked);
-        await db.inventory.update(item.id, {
-          stock: newStock,
-          updatedAt: new Date().toISOString(),
-        });
-        await logInventoryMovement(req.sku, 'outbound', req.picked, user?.displayName || 'Unknown', {
-          orderId: selectedOrder.orderId,
-          fromLocation: item.location,
-          note: `Shipped via Pick & Pack`,
-        });
-      }
+    try {
+      await confirmPickAndPackTransactional({
+        orderRecordId: selectedOrder.id,
+        pickedItems: requiredItems.map((r) => ({ sku: r.sku, picked: r.picked })),
+        operator: user?.displayName || 'Operator',
+        operatorRole: user?.role || 'operator',
+      });
+      setMessage({
+        type: 'success',
+        text: `Order ${selectedOrder.orderId} pick-verified & Packed! Ready for Carrier Label & Manifest in Shipping.`,
+      });
+      setSelectedOrder(null);
+      setRequiredItems([]);
+      loadData();
+    } catch (err) {
+      setMessage({ type: 'error', text: err instanceof Error ? err.message : 'Pack verification failed' });
     }
-
-    await logAction('ORDER_SHIPPED', `Order ${selectedOrder.orderId} verified and shipped (${requiredItems.map(r => `${r.picked}x ${r.sku}`).join(', ')})`, user?.displayName || 'Unknown');
-
-    setMessage({ type: 'success', text: `Order ${selectedOrder.orderId} verified and shipped!` });
-    setSelectedOrder(null);
-    setRequiredItems([]);
-    loadData();
   };
 
   const handleCreateWave = async () => {
@@ -191,34 +183,33 @@ export default function PickPack() {
   };
 
   const handleWaveComplete = async () => {
-    for (const order of waveOrders) {
-      const items = getRequiredItems(order);
-      const allPicked = items.every(req => (wavePicks[req.sku] || 0) >= req.quantity);
-      if (allPicked) {
-        await db.orders.update(order.id!, { status: 'Shipped', updatedAt: new Date().toISOString(), assignedTo: user?.displayName || 'Unknown' });
-        for (const req of items) {
-          const item = await db.inventory.where({ sku: req.sku }).first();
-          if (item && item.id) {
-            const pickedQty = wavePicks[req.sku] || req.quantity;
-            await db.inventory.update(item.id, {
-              stock: Math.max(0, (item.stock || 0) - pickedQty),
-              updatedAt: new Date().toISOString(),
-            });
-            await logInventoryMovement(req.sku, 'outbound', pickedQty, user?.displayName || 'Unknown', {
-              orderId: order.orderId,
-              fromLocation: item.location,
-              note: 'Shipped via Wave Pick',
-            });
-          }
+    try {
+      let packedCount = 0;
+      for (const order of waveOrders) {
+        if (!order.id) continue;
+        const items = getRequiredItems(order);
+        const allPicked = items.every(req => (wavePicks[req.sku] || 0) >= req.quantity);
+        if (allPicked) {
+          await confirmPickAndPackTransactional({
+            orderRecordId: order.id,
+            pickedItems: items.map((i) => ({ sku: i.sku, picked: i.quantity })),
+            operator: user?.displayName || 'Operator',
+            operatorRole: user?.role || 'operator',
+          });
+          packedCount++;
         }
-        await logAction('WAVE_SHIPPED', `Order ${order.orderId} shipped via wave`, user?.displayName || 'Unknown');
       }
+      setWaveOrders([]);
+      setWavePicks({});
+      setPickMode('standard');
+      loadData();
+      setMessage({
+        type: 'success',
+        text: `Wave pick completed: ${packedCount} order(s) Packed and staged for Carrier Shipping!`,
+      });
+    } catch (err) {
+      setMessage({ type: 'error', text: err instanceof Error ? err.message : 'Wave pack failed' });
     }
-    setWaveOrders([]);
-    setWavePicks({});
-    setPickMode('standard');
-    loadData();
-    setMessage({ type: 'success', text: 'Wave completed and orders shipped!' });
   };
 
   const sortedRequiredItems = (items: RequiredItem[]) => {
@@ -483,7 +474,7 @@ export default function PickPack() {
                   className="w-full flex items-center justify-center gap-2 py-3 bg-accent-sky text-void font-semibold text-sm rounded-md hover:bg-accent-sky/90 transition-colors disabled:opacity-30 disabled:cursor-not-allowed active:translate-y-[1px]"
                 >
                   <CheckCircle className="w-4 h-4" />
-                  Verify & Ship
+                  Verify Pick &amp; Pack Carton
                 </motion.button>
               </>
             )}
