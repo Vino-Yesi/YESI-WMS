@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { db, logAction, logInventoryMovement } from '@/lib/db';
+import { db, logAction } from '@/lib/db';
+import { dispositionQcHoldTransactional } from '@/lib/lifecycle';
 import { useAuth } from '@/lib/auth';
 import BarcodeReader from '@/components/BarcodeReader';
 import StatusBadge from '@/components/StatusBadge';
@@ -124,65 +125,35 @@ export default function QCManagement() {
   const handleRelease = async (hold: QCHold) => {
     if (!hold.id) return;
     try {
-      const now = new Date().toISOString();
-      await db.qcHolds.update(hold.id, {
-        status: 'released',
-        releasedAt: now,
+      const res = await dispositionQcHoldTransactional({
+        holdId: hold.id,
+        disposition: 'release',
+        operator: user?.displayName || 'Supervisor',
+        operatorRole: user?.role,
       });
-
-      // Add quantity back to inventory
-      const existing = await db.inventory.where({ sku: hold.sku }).first();
-      if (existing && existing.id) {
-        const newStock = (existing.stock || 0) + hold.quantity;
-        await db.inventory.update(existing.id, {
-          stock: newStock,
-          updatedAt: now,
-        });
-        await logInventoryMovement(hold.sku, 'qc_adjustment', hold.quantity, user?.displayName || 'Unknown', {
-          toLocation: existing.location,
-          note: `QC Release — ${hold.reason}`,
-        });
-      } else {
-        // Create inventory entry if it doesn't exist
-        await db.inventory.add({
-          sku: hold.sku,
-          product: 'Unknown Product',
-          stock: hold.quantity,
-          location: 'UNASSIGNED',
-          updatedAt: now,
-        });
-        await logInventoryMovement(hold.sku, 'qc_adjustment', hold.quantity, user?.displayName || 'Unknown', {
-          toLocation: 'UNASSIGNED',
-          note: `QC Release (new SKU) — ${hold.reason}`,
-        });
-      }
-
-      await logAction('QC_RELEASED', `QC Hold released: ${hold.quantity}x ${hold.sku}`, user?.displayName || 'Unknown');
-      showMessage('success', `Released ${hold.quantity}x ${hold.sku} to inventory`);
+      showMessage(
+        'success',
+        `QC Released ${hold.quantity}× ${hold.sku} → Directed Putaway Task ${res.putawayTaskId}`
+      );
       loadData();
-    } catch {
-      showMessage('error', 'Failed to release QC hold');
+    } catch (err) {
+      showMessage('error', err instanceof Error ? err.message : 'Failed to release QC hold');
     }
   };
 
   const handleReject = async (hold: QCHold) => {
     if (!hold.id) return;
     try {
-      const now = new Date().toISOString();
-      await db.qcHolds.update(hold.id, {
-        status: 'rejected',
-        releasedAt: now,
+      await dispositionQcHoldTransactional({
+        holdId: hold.id,
+        disposition: 'scrap',
+        operator: user?.displayName || 'Supervisor',
+        operatorRole: user?.role,
       });
-
-      await logInventoryMovement(hold.sku, 'qc_adjustment', hold.quantity, user?.displayName || 'Unknown', {
-        note: `QC Reject — ${hold.reason} (disposed)`,
-      });
-
-      await logAction('QC_REJECTED', `QC Hold rejected: ${hold.quantity}x ${hold.sku} — ${hold.reason}`, user?.displayName || 'Unknown');
-      showMessage('warning', `Rejected ${hold.quantity}x ${hold.sku} — quantity disposed`);
+      showMessage('warning', `Scrapped ${hold.quantity}× ${hold.sku} (${hold.reason})`);
       loadData();
-    } catch {
-      showMessage('error', 'Failed to reject QC hold');
+    } catch (err) {
+      showMessage('error', err instanceof Error ? err.message : 'Failed to scrap QC hold');
     }
   };
 

@@ -1,13 +1,14 @@
 {
   "name": "yesi-wms-enterprise",
   "private": true,
-  "version": "2.0.0",
+  "version": "2.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "node scripts/security-check.mjs && tsc -b && vite build",
     "lint": "eslint .",
     "test": "vitest run src/__tests__",
+    "check:security": "node scripts/security-check.mjs",
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",

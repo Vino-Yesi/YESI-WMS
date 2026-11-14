@@ -16,7 +16,7 @@ import {
   Lock,
   Cpu,
 } from 'lucide-react';
-import { supabase, SUPABASE_URL, WMS_TENANT_CODE, checkEdgeGatewayHealth, flushCloudOutbox, type WmsEdgeHealthResponse } from '@/lib/supabase';
+import { supabase, SUPABASE_URL, WMS_TENANT_CODE, isSupabaseConfigured, checkEdgeGatewayHealth, flushCloudOutbox, type WmsEdgeHealthResponse } from '@/lib/supabase';
 import {
   getSyncState,
   subscribeSyncState,
@@ -69,7 +69,7 @@ const DOMAIN_MATRIX = [
 ];
 
 export default function CloudMonitor() {
-  const { user } = useAuth();
+  const { user, switchWarehouse } = useAuth();
   const [syncState, setSyncState] = useState<SyncSnapshotState>(getSyncState);
   const [edgeHealth, setEdgeHealth] = useState<WmsEdgeHealthResponse | null>(null);
   const [warehouses, setWarehouses] = useState<
@@ -85,6 +85,10 @@ export default function CloudMonitor() {
   }, []);
 
   const refreshTelemetry = useCallback(async () => {
+    if (!isSupabaseConfigured) {
+      setEdgeHealth(await checkEdgeGatewayHealth(syncState.warehouseCode));
+      return;
+    }
     setLoading(true);
     try {
       const [health, whList, ledgerRes, outboxRes] = await Promise.all([
@@ -125,18 +129,25 @@ export default function CloudMonitor() {
 
   const handleFlushOutbox = async () => {
     setLoading(true);
-    const res = await flushCloudOutbox();
+    const res = await flushCloudOutbox(syncState.warehouseCode);
     await refreshTelemetry();
     setActionBanner(
       res.ok
         ? `Published ${res.published_count} transactional outbox events to downstream webhooks.`
-        : 'Could not reach Edge Function outbox publisher.'
+        : res.error || 'Could not reach Edge Function outbox publisher.'
     );
     setTimeout(() => setActionBanner(null), 4000);
   };
 
   const handleSwitchWarehouse = async (code: string) => {
     setLoading(true);
+    const scopeCheck = await switchWarehouse(code);
+    if (!scopeCheck.ok) {
+      setLoading(false);
+      setActionBanner(`Access denied: ${scopeCheck.error}`);
+      setTimeout(() => setActionBanner(null), 4000);
+      return;
+    }
     await setActiveWarehouseCode(code);
     await refreshTelemetry();
     setActionBanner(`Switched active fulfillment warehouse to ${code}.`);

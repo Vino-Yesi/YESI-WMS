@@ -4,8 +4,8 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        VITE_SUPABASE_URL: ${VITE_SUPABASE_URL:-https://xtbbnnwthhngapmxqyis.supabase.co}
-        VITE_SUPABASE_ANON_KEY: ${VITE_SUPABASE_ANON_KEY:-sb_publishable_ifExJmWE1FUV3hj968_Yzw_0Hr1ubJD}
+        VITE_SUPABASE_URL: ${VITE_SUPABASE_URL:?Set VITE_SUPABASE_URL in .env}
+        VITE_SUPABASE_ANON_KEY: ${VITE_SUPABASE_ANON_KEY:?Set VITE_SUPABASE_ANON_KEY in .env}
         VITE_WMS_TENANT_CODE: ${VITE_WMS_TENANT_CODE:-YESI-FZCO}
         VITE_WMS_DEFAULT_WAREHOUSE: ${VITE_WMS_DEFAULT_WAREHOUSE:-DXB-FC1}
     ports:
@@ -30,8 +30,8 @@ services:
   grafana:
     image: grafana/grafana:11.3.0
     environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=yesi-wms-monitor
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env}
     ports:
       - "3001:3000"
     depends_on:

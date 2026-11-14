@@ -1,7 +1,8 @@
-import { Routes, Route, Navigate } from 'react-router-dom';
+import { Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { AuthProvider, useAuth } from '@/lib/auth';
 import { seedDatabase } from '@/lib/db';
-import { startHybridSyncEngine } from '@/lib/supabaseSync';
+import { startHybridSyncEngine, setActiveWarehouseCode } from '@/lib/supabaseSync';
+import { runtimeConfig } from '@/lib/config';
 import { useEffect, useState, Suspense, lazy, type ComponentType } from 'react';
 import Layout from '@/components/Layout';
 import OfflineIndicator from '@/components/OfflineIndicator';
@@ -9,6 +10,7 @@ import InstallPrompt from '@/components/InstallPrompt';
 import CommandPalette from '@/components/CommandPalette';
 import AIAssistant from '@/components/AIAssistant';
 import { RouteErrorBoundary } from '@/components/ErrorBoundary';
+import { ShieldAlert, AlertTriangle } from 'lucide-react';
 import Login from '@/pages/Login';
 
 // Core & Executive
@@ -62,7 +64,40 @@ function PageLoader() {
   );
 }
 
-function LazyPage({ component: C, title }: { component: ComponentType; title?: string }) {
+function AccessDenied({ title, permission }: { title?: string; permission: string }) {
+  const { user } = useAuth();
+  return (
+    <div className="max-w-lg mx-auto mt-16 glass-panel rounded-xl p-8 text-center border border-accent-red/20">
+      <div className="w-12 h-12 rounded-full bg-accent-red/10 border border-accent-red/20 flex items-center justify-center mx-auto mb-4">
+        <ShieldAlert className="w-6 h-6 text-accent-red" />
+      </div>
+      <h2 className="text-lg font-bold text-text-primary mb-2">Module Access Restricted</h2>
+      <p className="text-xs text-text-secondary leading-relaxed mb-4">
+        Your active role (<span className="font-mono text-accent-sky">{user?.role || 'viewer'}</span>) in warehouse{' '}
+        <span className="font-mono text-text-primary">{user?.warehouseCode || 'UNSCOPED'}</span> does not hold the
+        required permission <span className="font-mono text-accent-yellow">{permission}</span> for{' '}
+        <span className="text-text-primary">{title || 'this module'}</span>.
+      </p>
+      <p className="text-[11px] text-text-secondary/70">
+        Contact a Shift Supervisor or System Administrator to request RBAC elevation.
+      </p>
+    </div>
+  );
+}
+
+function GuardedPage({
+  component: C,
+  title,
+  permission,
+}: {
+  component: ComponentType;
+  title: string;
+  permission: string;
+}) {
+  const { can } = useAuth();
+  if (!can(permission)) {
+    return <AccessDenied title={title} permission={permission} />;
+  }
   return (
     <RouteErrorBoundary title={title}>
       <Suspense fallback={<PageLoader />}>
@@ -72,8 +107,41 @@ function LazyPage({ component: C, title }: { component: ComponentType; title?: s
   );
 }
 
+/**
+ * Starts the Hybrid Sync Engine ONLY AFTER:
+ *  1. Local IndexedDB seed/schema migration has completed cleanly
+ *  2. An authenticated operator session with a validated warehouse scope is active
+ *  3. Cloud configuration has passed strict startup validation
+ */
+function AuthenticatedSyncOrchestrator() {
+  const { user } = useAuth();
+
+  useEffect(() => {
+    if (!user || !runtimeConfig.cloudEnabled) return;
+    let stopSync: (() => void) | null = null;
+    let cancelled = false;
+
+    void setActiveWarehouseCode(user.warehouseCode)
+      .catch(() => {})
+      .finally(() => {
+        if (!cancelled) {
+          stopSync = startHybridSyncEngine(user.warehouseCode);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+      stopSync?.();
+    };
+  }, [user]);
+
+  return null;
+}
+
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
-  const { user, loading } = useAuth();
+  const { user, loading, canAccessModule } = useAuth();
+  const location = useLocation();
+
   if (loading) {
     return (
       <div className="fixed inset-0 flex items-center justify-center bg-void">
@@ -82,6 +150,13 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
     );
   }
   if (!user) return <Navigate to="/login" replace />;
+
+  // Enforce route-level RBAC check as a defense-in-depth gate
+  if (!canAccessModule(location.pathname) && location.pathname !== '/') {
+    return (
+      <Layout />
+    );
+  }
   return <>{children}</>;
 }
 
@@ -93,53 +168,54 @@ function AppRoutes() {
         path="/"
         element={
           <ProtectedRoute>
+            <AuthenticatedSyncOrchestrator />
             <Layout />
           </ProtectedRoute>
         }
       >
         {/* Control Tower & Instant Wave */}
-        <Route index element={<LazyPage component={Dashboard} title="Control Tower Dashboard" />} />
-        <Route path="dashboard" element={<LazyPage component={Dashboard} title="Control Tower Dashboard" />} />
-        <Route path="daily" element={<LazyPage component={DailyManual} title="Daily Instant Fulfillment" />} />
-        <Route path="workflow" element={<LazyPage component={WorkflowSummary} title="Fulfillment Workflow Blueprint" />} />
-        <Route path="cloud" element={<LazyPage component={CloudMonitor} title="Cloud Core & Telemetry" />} />
-        <Route path="guardian" element={<LazyPage component={GuardianDashboard} title="Guardian Ops Center" />} />
+        <Route index element={<GuardedPage component={Dashboard} title="Control Tower Dashboard" permission="dashboard.view" />} />
+        <Route path="dashboard" element={<GuardedPage component={Dashboard} title="Control Tower Dashboard" permission="dashboard.view" />} />
+        <Route path="daily" element={<GuardedPage component={DailyManual} title="Daily Instant Fulfillment" permission="daily.execute" />} />
+        <Route path="workflow" element={<GuardedPage component={WorkflowSummary} title="Fulfillment Workflow Blueprint" permission="workflow.view" />} />
+        <Route path="cloud" element={<GuardedPage component={CloudMonitor} title="Cloud Core & Telemetry" permission="cloud.view" />} />
+        <Route path="guardian" element={<GuardedPage component={GuardianDashboard} title="Guardian Ops Center" permission="guardian.view" />} />
 
         {/* Inbound Operations (Domain 04) */}
-        <Route path="dock" element={<LazyPage component={DockManagement} title="Dock Scheduling & ASN" />} />
-        <Route path="inbound" element={<LazyPage component={InboundReceiving} title="Inbound Receiving & GRN" />} />
-        <Route path="qc" element={<LazyPage component={QCManagement} title="Quality Inspection & Holds" />} />
-        <Route path="putaway" element={<LazyPage component={PutawayManagement} title="Directed Putaway" />} />
+        <Route path="dock" element={<GuardedPage component={DockManagement} title="Dock Scheduling & ASN" permission="dock.view" />} />
+        <Route path="inbound" element={<GuardedPage component={InboundReceiving} title="Inbound Receiving & GRN" permission="inbound.execute" />} />
+        <Route path="qc" element={<GuardedPage component={QCManagement} title="Quality Inspection & Holds" permission="qc.inspect" />} />
+        <Route path="putaway" element={<GuardedPage component={PutawayManagement} title="Directed Putaway" permission="putaway.execute" />} />
 
         {/* Inventory & Location Control (Domains 02, 03, 05, 07) */}
-        <Route path="inventory" element={<LazyPage component={InventoryHub} title="Inventory Hub & Oracle" />} />
-        <Route path="serial-tracking" element={<LazyPage component={SerialTracking} title="Serial & IMEI Traceability" />} />
-        <Route path="cycle-count" element={<LazyPage component={CycleCount} title="ABC Cycle Counting" />} />
-        <Route path="replenishment" element={<LazyPage component={Replenishment} title="Min/Max Replenishment" />} />
-        <Route path="barcode-generator" element={<LazyPage component={LocationBarcodeGenerator} title="Location & SKU Barcodes" />} />
-        <Route path="barcode-scanner" element={<LazyPage component={BarcodeScanner} title="RF / Camera Scanner" />} />
+        <Route path="inventory" element={<GuardedPage component={InventoryHub} title="Inventory Hub & Oracle" permission="inventory.view" />} />
+        <Route path="serial-tracking" element={<GuardedPage component={SerialTracking} title="Serial & IMEI Traceability" permission="serial.track" />} />
+        <Route path="cycle-count" element={<GuardedPage component={CycleCount} title="ABC Cycle Counting" permission="cycle_count.execute" />} />
+        <Route path="replenishment" element={<GuardedPage component={Replenishment} title="Min/Max Replenishment" permission="replenishment.execute" />} />
+        <Route path="barcode-generator" element={<GuardedPage component={LocationBarcodeGenerator} title="Location & SKU Barcodes" permission="tools.use" />} />
+        <Route path="barcode-scanner" element={<GuardedPage component={BarcodeScanner} title="RF / Camera Scanner" permission="tools.use" />} />
 
         {/* Outbound, Transport & Returns (Domains 06, 08, 09) */}
-        <Route path="pick-pack" element={<LazyPage component={PickPack} title="Pick & Pack Station" />} />
-        <Route path="batch-pick" element={<LazyPage component={BatchPickCenter} title="Wave & Batch Pick Center" />} />
-        <Route path="shipping" element={<LazyPage component={Shipping} title="Carrier Dispatch & Manifest" />} />
-        <Route path="posting" element={<LazyPage component={PostingTracker} title="Proof-of-Dispatch Tracker" />} />
-        <Route path="returns" element={<LazyPage component={Returns} title="RMA & Returns Disposition" />} />
+        <Route path="pick-pack" element={<GuardedPage component={PickPack} title="Pick & Pack Station" permission="outbound.execute" />} />
+        <Route path="batch-pick" element={<GuardedPage component={BatchPickCenter} title="Wave & Batch Pick Center" permission="outbound.execute" />} />
+        <Route path="shipping" element={<GuardedPage component={Shipping} title="Carrier Dispatch & Manifest" permission="outbound.ship" />} />
+        <Route path="posting" element={<GuardedPage component={PostingTracker} title="Proof-of-Dispatch Tracker" permission="outbound.ship" />} />
+        <Route path="returns" element={<GuardedPage component={Returns} title="RMA & Returns Disposition" permission="returns.execute" />} />
 
         {/* Floor Utilities, Integrations & Administration (Domains 10, 11, 12) */}
-        <Route path="pdf-sequencer" element={<LazyPage component={PDFSequencer} title="PDF Label Sequencer" />} />
-        <Route path="templates" element={<LazyPage component={Templates} title="SKU Mapping Templates" />} />
-        <Route path="bulk-convert" element={<LazyPage component={BulkConverter} title="Bulk Data Converter" />} />
-        <Route path="auditor" element={<LazyPage component={Auditor} title="Pack & Weight Auditor" />} />
-        <Route path="sim-manager" element={<LazyPage component={SIMManager} title="SIM / IMEI TAC Registry" />} />
-        <Route path="gsheet" element={<LazyPage component={GSheetHub} title="Daily G-Sheet Tracker" />} />
-        <Route path="ozon-sheets" element={<LazyPage component={OzonSheetsHub} title="Ozon Live Sheet Pipeline" />} />
-        <Route path="integrations" element={<LazyPage component={IntegrationHub} title="ERP / OMS Integration Hub" />} />
-        <Route path="labor" element={<LazyPage component={LaborManagement} title="Labor & UPH Management" />} />
-        <Route path="analytics" element={<LazyPage component={Analytics} title="Operational Analytics & KPIs" />} />
-        <Route path="memory" element={<LazyPage component={Memory} title="Warehouse Rules & Aliases" />} />
-        <Route path="users" element={<LazyPage component={UserManagement} title="RBAC User & Audit Management" />} />
-        <Route path="settings" element={<LazyPage component={Settings} title="System Settings" />} />
+        <Route path="pdf-sequencer" element={<GuardedPage component={PDFSequencer} title="PDF Label Sequencer" permission="tools.use" />} />
+        <Route path="templates" element={<GuardedPage component={Templates} title="SKU Mapping Templates" permission="tools.use" />} />
+        <Route path="bulk-convert" element={<GuardedPage component={BulkConverter} title="Bulk Data Converter" permission="tools.use" />} />
+        <Route path="auditor" element={<GuardedPage component={Auditor} title="Pack & Weight Auditor" permission="outbound.pack" />} />
+        <Route path="sim-manager" element={<GuardedPage component={SIMManager} title="SIM / IMEI TAC Registry" permission="tools.use" />} />
+        <Route path="gsheet" element={<GuardedPage component={GSheetHub} title="Daily G-Sheet Tracker" permission="tools.use" />} />
+        <Route path="ozon-sheets" element={<GuardedPage component={OzonSheetsHub} title="Ozon Live Sheet Pipeline" permission="tools.use" />} />
+        <Route path="integrations" element={<GuardedPage component={IntegrationHub} title="ERP / OMS Integration Hub" permission="integrations.manage" />} />
+        <Route path="labor" element={<GuardedPage component={LaborManagement} title="Labor & UPH Management" permission="labor.manage" />} />
+        <Route path="analytics" element={<GuardedPage component={Analytics} title="Operational Analytics & KPIs" permission="reports.view" />} />
+        <Route path="memory" element={<GuardedPage component={Memory} title="Warehouse Rules & Aliases" permission="memory.manage" />} />
+        <Route path="users" element={<GuardedPage component={UserManagement} title="RBAC User & Audit Management" permission="users.manage" />} />
+        <Route path="settings" element={<GuardedPage component={Settings} title="System Settings" permission="dashboard.view" />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
@@ -147,23 +223,49 @@ function AppRoutes() {
 }
 
 export default function App() {
-  const [ready, setReady] = useState(false);
+  const [bootState, setBootState] = useState<'booting' | 'ready' | 'degraded'>('booting');
+  const [bootWarning, setBootWarning] = useState<string | null>(null);
 
   useEffect(() => {
-    let stopSync: (() => void) | null = null;
-    seedDatabase().then(() => {
-      setReady(true);
-      stopSync = startHybridSyncEngine();
-    });
+    let cancelled = false;
+
+    async function bootstrapStorage() {
+      const timeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('IndexedDB initialization timed out after 8s')), 8_000)
+      );
+
+      try {
+        await Promise.race([seedDatabase(), timeout]);
+        if (!cancelled) {
+          if (runtimeConfig.errors.length > 0) {
+            setBootWarning(runtimeConfig.errors.join(' '));
+          }
+          setBootState('ready');
+        }
+      } catch (err) {
+        // Resilient degraded boot: never hang on a blank spinner if IndexedDB is blocked/corrupted
+        if (!cancelled) {
+          setBootWarning(
+            err instanceof Error
+              ? `Local edge database degraded (${err.message}). Continuing in resilient mode.`
+              : 'Local edge database degraded.'
+          );
+          setBootState('degraded');
+        }
+      }
+    }
+
+    void bootstrapStorage();
     return () => {
-      stopSync?.();
+      cancelled = true;
     };
   }, []);
 
-  if (!ready) {
+  if (bootState === 'booting') {
     return (
-      <div className="fixed inset-0 flex items-center justify-center bg-black">
+      <div className="fixed inset-0 flex flex-col items-center justify-center bg-black gap-3">
         <div className="w-10 h-10 border-2 border-accent-sky border-t-transparent rounded-full animate-spin" />
+        <p className="text-xs text-white/50 font-mono">Initializing YESI-WMS Edge Storage…</p>
       </div>
     );
   }
@@ -171,6 +273,12 @@ export default function App() {
   return (
     <AuthProvider>
       <RouteErrorBoundary title="Application Error">
+        {bootWarning && (
+          <div className="bg-amber-500/15 border-b border-amber-500/30 text-amber-300 text-xs px-4 py-1.5 flex items-center justify-center gap-2 z-50 relative">
+            <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+            <span>{bootWarning}</span>
+          </div>
+        )}
         <OfflineIndicator />
         <InstallPrompt />
         <CommandPalette />

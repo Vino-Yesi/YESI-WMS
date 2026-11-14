@@ -117,7 +117,7 @@ const adminItems: NavItem[] = [
 export default function Sidebar({ mobileOpen, onClose }: SidebarProps) {
   const location = useLocation();
   const navigate = useNavigate();
-  const { isAdmin, isSupervisor, logout } = useAuth();
+  const { isAdmin, isSupervisor, canAccessModule, logout } = useAuth();
   const density = useAppStore((s) => s.density);
   const collapsed = useAppStore((s) => s.sidebarCollapsed);
   const toggleCollapsed = useAppStore((s) => s.toggleSidebarCollapsed);
@@ -150,6 +150,7 @@ export default function Sidebar({ mobileOpen, onClose }: SidebarProps) {
       .filter((item) => {
         if (item.adminOnly && !isAdmin) return false;
         if (item.supervisorOnly && !isSupervisor) return false;
+        if (!item.aiTrigger && !canAccessModule(item.path)) return false;
         return true;
       })
       .map((item) => {

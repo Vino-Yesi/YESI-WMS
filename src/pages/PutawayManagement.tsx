@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { db, logAction, logInventoryMovement } from '@/lib/db';
+import { db, logAction } from '@/lib/db';
+import { completePutawayTransactional } from '@/lib/lifecycle';
 import { useAuth } from '@/lib/auth';
 import {
   ArrowDownToLine, MapPin, PlayCircle, CheckCircle2, Clock,
@@ -64,34 +65,23 @@ export default function PutawayManagement() {
   };
 
   const completeTask = async (task: PutawayTask, actualLocation?: string) => {
-    const location = actualLocation || task.suggestedLocation;
-    const now = new Date().toISOString();
-
-    await db.putawayTasks.update(task.id!, {
-      status: 'completed',
-      actualLocation: location,
-      completedAt: now,
-      actualTime: task.startedAt ? Math.round((Date.now() - new Date(task.startedAt).getTime()) / 60000) : task.estimatedTime,
-    });
-
-    const item = await db.inventory.where('sku').equals(task.sku).first();
-    if (item) {
-      await db.inventory.update(item.id!, {
-        stock: (item.stock || 0) + task.quantity,
-        location,
-        updatedAt: now,
+    if (!task.id) return;
+    try {
+      const res = await completePutawayTransactional({
+        taskId: task.id,
+        actualLocation: actualLocation || task.suggestedLocation,
+        operator: user?.displayName || 'operator',
+        operatorRole: user?.role || 'operator',
       });
+      setMessage({
+        type: 'success',
+        text: `Putaway ${task.taskId} confirmed → ${res.location} (allocatable stock: ${res.newStock})`,
+      });
+      setSelected(null);
+      loadTasks();
+    } catch (err) {
+      setMessage({ type: 'error', text: err instanceof Error ? err.message : 'Putaway failed' });
     }
-
-    await logInventoryMovement(task.sku, 'putaway', task.quantity, user?.displayName || 'system', {
-      fromLocation: task.sourceLocation,
-      toLocation: location,
-      note: `Putaway ${task.taskId}`,
-    });
-    await logAction('PUTAWAY_COMPLETE', `Completed ${task.taskId} → ${location}`, user?.displayName || 'system');
-    setMessage({ type: 'success', text: `Putaway ${task.taskId} completed → ${location}` });
-    setSelected(null);
-    loadTasks();
   };
 
   const createFromReceiving = async () => {

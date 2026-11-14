@@ -1,7 +1,7 @@
 import { useState, useCallback, useEffect, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { db, logAction } from '@/lib/db';
-import { enqueueCloudOperation } from '@/lib/supabaseSync';
+import { dispatchShipmentTransactional } from '@/lib/lifecycle';
 import { useAuth } from '@/lib/auth';
 import {
   Truck, DollarSign, Package, Printer, Barcode, MapPin, CheckCircle,
@@ -196,57 +196,45 @@ export default function Shipping() {
   };
 
   const handleShipOrder = async () => {
-    if (!selectedOrder || !selectedRate || !generatedLabel) {
+    if (!selectedOrder?.id || !selectedRate || !generatedLabel) {
       setMessage({ type: 'error', text: 'Generate label before shipping.' });
       return;
     }
-    const weight = calculateOrderWeight(selectedOrder);
-    const dims = calculateOrderDimensions(selectedOrder);
-    await db.orders.update(selectedOrder.id!, {
-      status: 'Shipped',
-      carrier: selectedRate.carrier,
-      service: selectedRate.service,
-      trackingNumber: generatedLabel.trackingNumber,
-      shippingCost: generatedLabel.cost,
-      weightTotal: weight,
-      dimensionsTotal: JSON.stringify(dims),
-      suggestedBoxSize: suggestedBox?.name,
-      actualBoxSize: suggestedBox?.name,
-      updatedAt: new Date().toISOString(),
-    });
-    setOrders(prev =>
-      prev.map(o =>
-        o.id === selectedOrder.id
-          ? {
-              ...o,
-              status: 'Shipped',
-              carrier: selectedRate.carrier,
-              service: selectedRate.service,
-              trackingNumber: generatedLabel.trackingNumber,
-              shippingCost: generatedLabel.cost,
-              weightTotal: weight,
-              dimensionsTotal: JSON.stringify(dims),
-              suggestedBoxSize: suggestedBox?.name,
-              actualBoxSize: suggestedBox?.name,
-              updatedAt: new Date().toISOString(),
-            }
-          : o
-      )
-    );
-    setSelectedOrder(null);
-    setSelectedRate(null);
-    setGeneratedLabel(null);
-    setSuggestedBox(null);
-    setMessage({ type: 'success', text: `Order ${selectedOrder.orderId} shipped!` });
-    if (user) {
-      await logAction('ORDER_SHIPPED', `Shipped ${selectedOrder.orderId} via ${selectedRate.carrier} ${selectedRate.service}`, user.displayName);
+    try {
+      const weight = calculateOrderWeight(selectedOrder);
+      const dims = calculateOrderDimensions(selectedOrder);
+
+      const { shipmentRef } = await dispatchShipmentTransactional({
+        orderRecordId: selectedOrder.id,
+        labelRecordId: generatedLabel.id,
+        carrier: selectedRate.carrier,
+        trackingNumber: generatedLabel.trackingNumber,
+        operator: user?.displayName || 'Operator',
+        operatorRole: user?.role || 'operator',
+      });
+
+      await db.orders.update(selectedOrder.id, {
+        service: selectedRate.service,
+        shippingCost: generatedLabel.cost,
+        weightTotal: weight,
+        dimensionsTotal: JSON.stringify(dims),
+        suggestedBoxSize: suggestedBox?.name,
+        actualBoxSize: suggestedBox?.name,
+      });
+
+      const orderIdCopy = selectedOrder.orderId;
+      setSelectedOrder(null);
+      setSelectedRate(null);
+      setGeneratedLabel(null);
+      setSuggestedBox(null);
+      await loadData();
+      setMessage({
+        type: 'success',
+        text: `Shipment ${shipmentRef}: Order ${orderIdCopy} dispatched & stock ledger updated!`,
+      });
+    } catch (err) {
+      setMessage({ type: 'error', text: err instanceof Error ? err.message : 'Shipment dispatch failed' });
     }
-    void enqueueCloudOperation('dispatch_order', {
-      orderId: selectedOrder.orderId,
-      carrier: selectedRate.carrier,
-      trackingNumber: generatedLabel.trackingNumber,
-      operator: user?.displayName || 'Operator',
-    }).catch(() => {});
   };
 
   const handleTrack = (order: Order) => {
