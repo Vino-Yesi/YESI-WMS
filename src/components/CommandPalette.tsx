@@ -6,13 +6,15 @@ import {
   LayoutDashboard, Package, PackageOpen, ClipboardList, RotateCcw,
   ScanBarcode, Scale, RefreshCw, FileText, Brain, ClipboardCheck,
   BarChart3, Zap, ShieldCheck, Settings, Users, Smartphone, Shield,
-  Camera, QrCode, X, Search, Bell, ChevronRight, Barcode, Truck,
+  X, Search, Bell, ChevronRight, Barcode, Truck,
   ArrowDownToLine, Fingerprint, Layers, UsersRound, Bot, Plug, Sheet,
-  Link2,
+  Database,
 } from 'lucide-react';
 
 const navRoutes = [
-  { icon: LayoutDashboard, label: 'Dashboard', path: '/', keywords: 'home overview stats' },
+  { icon: LayoutDashboard, label: 'Control Tower Dashboard', path: '/', keywords: 'home overview stats kpi' },
+  { icon: Zap, label: 'Daily Instant Manual', path: '/daily', keywords: 'wave posting daily manual' },
+  { icon: Database, label: 'Cloud & Supabase Core', path: '/cloud', keywords: 'supabase postgres sql ledger outbox cloud' },
   { icon: Package, label: 'Inbound Receiving', path: '/inbound', keywords: 'receive goods incoming' },
   { icon: ClipboardList, label: 'Inventory Hub', path: '/inventory', keywords: 'stock items sku' },
   { icon: Fingerprint, label: 'Serial Tracking', path: '/serial-tracking', keywords: 'serial imei traceability' },

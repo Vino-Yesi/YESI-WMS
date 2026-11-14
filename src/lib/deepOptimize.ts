@@ -86,8 +86,8 @@ export function downloadDeepOptimizeJob(job: DeepOptimizeJob, filename?: string)
 export function parseDeepOptimizeResult(raw: unknown): DeepOptimizeResult {
   const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
   if (!data || typeof data !== 'object') throw new Error('Invalid deep optimize result');
-  const r = data as DeepOptimizeResult;
-  if (r.schema !== DEEP_OPTIMIZE_SCHEMA) throw new Error(`Unsupported schema ${String((r as any).schema)}`);
+  const r = data as DeepOptimizeResult & { schema?: unknown };
+  if (r.schema !== DEEP_OPTIMIZE_SCHEMA) throw new Error(`Unsupported schema ${String(r.schema)}`);
   if (!Array.isArray(r.orderedKeys) || r.orderedKeys.length === 0) {
     throw new Error('Result must include non-empty orderedKeys');
   }
@@ -107,9 +107,9 @@ export async function persistDeepOptimizeJob(job: DeepOptimizeJob, operator: str
   const serialized = JSON.stringify(job);
   const existing = await db.preferences.where('key').equals(PREF_LAST_JOB).first();
   if (existing?.id != null) {
-    await db.preferences.update(existing.id, { value: serialized, createdAt: job.createdAt } as any);
+    await db.preferences.update(existing.id, { value: serialized, createdAt: job.createdAt });
   } else {
-    await db.preferences.add({ key: PREF_LAST_JOB, value: serialized, createdAt: job.createdAt } as any);
+    await db.preferences.add({ key: PREF_LAST_JOB, value: serialized, createdAt: job.createdAt });
   }
   await logAction('DEEP_OPTIMIZE_EXPORT', `job=${job.jobId} items=${job.items.length}`, operator);
 }
@@ -118,13 +118,13 @@ export async function persistDeepOptimizeResult(result: DeepOptimizeResult, oper
   const serialized = JSON.stringify(result);
   const existing = await db.preferences.where('key').equals(PREF_LAST_RESULT).first();
   if (existing?.id != null) {
-    await db.preferences.update(existing.id, { value: serialized, createdAt: result.completedAt } as any);
+    await db.preferences.update(existing.id, { value: serialized, createdAt: result.completedAt });
   } else {
     await db.preferences.add({
       key: PREF_LAST_RESULT,
       value: serialized,
       createdAt: result.completedAt,
-    } as any);
+    });
   }
   await logAction(
     'DEEP_OPTIMIZE_IMPORT',
@@ -151,7 +151,8 @@ export function applyDeepOptimizeOrder<T extends { trackingId: string; product: 
 }
 
 /** Placeholder for future POST to HPC — currently no-op that documents the contract */
-export async function submitDeepOptimizeToHpc(_job: DeepOptimizeJob): Promise<{ accepted: false; reason: string }> {
+export async function submitDeepOptimizeToHpc(job: DeepOptimizeJob): Promise<{ accepted: false; reason: string }> {
+  void job;
   return {
     accepted: false,
     reason: 'HPC endpoint not configured. Export JSON and import the result when ready.',

@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { db, logAction, logInventoryMovement } from '@/lib/db';
+import { enqueueCloudOperation } from '@/lib/supabaseSync';
 import { useAuth } from '@/lib/auth';
 import BarcodeReader from '@/components/BarcodeReader';
 import { Package, Plus, History, ArrowRight, AlertTriangle, ShieldCheck, FileSpreadsheet, Upload, CheckCircle, ClipboardList, Sheet } from 'lucide-react';
@@ -231,6 +232,16 @@ export default function InboundReceiving() {
       lotNumber: opts?.lot?.trim() || undefined,
       note: opts?.crossDock?.trim() ? `Cross-dock for ${opts.crossDock}` : `Inbound receipt`,
     });
+
+    void enqueueCloudOperation('inbound_grn', {
+      sku: rSku.trim(),
+      qty: rQty,
+      description: rDesc || null,
+      bin: finalBin,
+      lotNumber: opts?.lot?.trim() || 'DEFAULT',
+      qcStatus: opts?.qc || 'passed',
+      operator: user?.displayName || 'Operator',
+    }).catch(() => {});
   };
 
   const handleReceive = async () => {

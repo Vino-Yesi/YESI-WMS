@@ -32,17 +32,21 @@ function detectPlatform(): Platform {
   return 'desktop';
 }
 
+interface BeforeInstallPromptEvent extends Event {
+  prompt: () => Promise<void>;
+  userChoice: Promise<{ outcome: 'accepted' | 'dismissed' }>;
+}
+
 const DISMISS_KEY = 'yesi_install_dismissed_v2';
 
 export default function InstallPrompt() {
-  const [deferredPrompt, setDeferredPrompt] = useState<any>(null);
+  const [deferredPrompt, setDeferredPrompt] = useState<BeforeInstallPromptEvent | null>(null);
   const [showPrompt, setShowPrompt] = useState(false);
-  const [platform, setPlatform] = useState<Platform>('desktop');
+  const [platform] = useState<Platform>(detectPlatform);
   const [showIosGuide, setShowIosGuide] = useState(false);
 
   useEffect(() => {
-    const p = detectPlatform();
-    setPlatform(p);
+    const p = platform;
     if (p === 'standalone' || p === 'tauri') return;
 
     try {
@@ -54,7 +58,7 @@ export default function InstallPrompt() {
     // Chrome / Edge / Android: native install prompt
     const onBip = (e: Event) => {
       e.preventDefault();
-      setDeferredPrompt(e);
+      setDeferredPrompt(e as BeforeInstallPromptEvent);
       setShowPrompt(true);
     };
     window.addEventListener('beforeinstallprompt', onBip);
@@ -75,7 +79,7 @@ export default function InstallPrompt() {
       window.removeEventListener('beforeinstallprompt', onBip);
       if (iosTimer) clearTimeout(iosTimer);
     };
-  }, []);
+  }, [platform]);
 
   const dismiss = useCallback(() => {
     setShowPrompt(false);

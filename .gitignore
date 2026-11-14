@@ -1,0 +1,23 @@
+# Dependencies & build outputs
+node_modules/
+dist/
+dist-ssr/
+releases/
+src-tauri/target/
+src-tauri/gen/
+
+# Playwright & test artifacts
+playwright-report/
+test-results/
+blob-report/
+
+# Environment secrets (keep .env.example committed)
+.env
+.env.local
+.env.*.local
+
+# OS & editor files
+.DS_Store
+Thumbs.db
+*.log
+npm-debug.log*

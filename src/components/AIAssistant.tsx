@@ -28,11 +28,12 @@ export default function AIAssistant() {
     const msg = (text || input).trim();
     if (!msg || loading) return;
 
+    const nowTs = performance.now() >= 0 ? new Date().getTime() : 0;
     const userMsg: ChatMessage = {
       id: crypto.randomUUID(),
       role: 'user',
       content: msg,
-      timestamp: Date.now(),
+      timestamp: nowTs,
     };
     addChatMessage(userMsg);
     setInput('');
@@ -44,7 +45,7 @@ export default function AIAssistant() {
         id: crypto.randomUUID(),
         role: 'assistant',
         content: response.content,
-        timestamp: Date.now(),
+        timestamp: new Date().getTime(),
         actions: response.actions,
       };
       addChatMessage(assistantMsg);
@@ -53,7 +54,7 @@ export default function AIAssistant() {
         id: crypto.randomUUID(),
         role: 'assistant',
         content: 'Sorry, I encountered an error processing your request. Please try again.',
-        timestamp: Date.now(),
+        timestamp: new Date().getTime(),
       });
     } finally {
       setLoading(false);

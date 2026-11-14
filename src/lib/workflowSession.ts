@@ -53,25 +53,25 @@ function safeParse(raw: unknown): WorkflowSession | null {
   try {
     const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
     if (!data || typeof data !== 'object') return null;
+    const rec = data as Record<string, unknown>;
     // Migrate legacy (no v field)
-    if ((data as any).v == null && Array.isArray((data as any).rows)) {
-      const legacy = data as any;
+    if (rec.v == null && Array.isArray(rec.rows)) {
       return {
         v: 1,
-        operator: legacy.operator || 'anonymous',
-        step: legacy.step || 1,
-        rows: legacy.rows || [],
-        fileName: legacy.fileName || '',
-        assembled: legacy.assembled || [],
-        actualPaste: legacy.actualPaste || '',
-        auditRows: legacy.auditRows || [],
-        scanEvents: (legacy.scanEvents || []).slice(0, 200),
-        shippedBatches: legacy.shippedBatches || [],
-        orderRemarks: legacy.orderRemarks || {},
-        receivedAt: legacy.receivedAt ?? null,
-        productSort: legacy.productSort || 'none',
-        savedAt: legacy.savedAt || new Date().toISOString(),
-        tabId: legacy.tabId || getTabId(),
+        operator: (rec.operator as string) || 'anonymous',
+        step: (rec.step as 1 | 2 | 3 | 4 | 5) || 1,
+        rows: (rec.rows as WorkflowSession['rows']) || [],
+        fileName: (rec.fileName as string) || '',
+        assembled: (rec.assembled as string[]) || [],
+        actualPaste: (rec.actualPaste as string) || '',
+        auditRows: (rec.auditRows as unknown[]) || [],
+        scanEvents: ((rec.scanEvents as unknown[]) || []).slice(0, 200),
+        shippedBatches: (rec.shippedBatches as string[]) || [],
+        orderRemarks: (rec.orderRemarks as Record<string, string>) || {},
+        receivedAt: (rec.receivedAt as string | null) ?? null,
+        productSort: (rec.productSort as WorkflowSession['productSort']) || 'none',
+        savedAt: (rec.savedAt as string) || new Date().toISOString(),
+        tabId: (rec.tabId as string) || getTabId(),
       };
     }
     if ((data as WorkflowSession).v !== WORKFLOW_SESSION_VERSION) return null;
@@ -86,12 +86,12 @@ export async function loadWorkflowSession(operator: string): Promise<WorkflowSes
   const key = sessionKey(operator);
   try {
     const pref = await db.preferences.where('key').equals(key).first();
-    const fromDb = safeParse((pref as any)?.value);
+    const fromDb = safeParse(pref?.value);
     if (fromDb?.rows?.length) return fromDb;
 
     // Legacy global key migration
     const legacyPref = await db.preferences.where('key').equals(LEGACY_KEY).first();
-    const fromLegacy = safeParse((legacyPref as any)?.value);
+    const fromLegacy = safeParse(legacyPref?.value);
     if (fromLegacy?.rows?.length) {
       fromLegacy.operator = operator;
       fromLegacy.v = 1;
@@ -131,13 +131,13 @@ export async function saveWorkflowSession(session: WorkflowSession): Promise<voi
       await db.preferences.update(existing.id, {
         value: serialized,
         createdAt: payload.savedAt,
-      } as any);
+      });
     } else {
       await db.preferences.add({
         key,
         value: serialized,
         createdAt: payload.savedAt,
-      } as any);
+      });
     }
   } catch {
     /* quota */

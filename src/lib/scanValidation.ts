@@ -44,12 +44,12 @@ export function extractTrackingId(raw: string): string | null {
   if (m) return m[0];
   // bare numeric / alphanumeric codes ≥ 8
   const compact = t.replace(/\s+/g, '');
-  if (/^[\dA-Za-z\-]{8,32}$/.test(compact)) return compact;
+  if (/^[\dA-Za-z-]{8,32}$/.test(compact)) return compact;
   return null;
 }
 
 export function normalizeTracking(id: string): string {
-  return id.replace(/[\s]/g, '').toLowerCase();
+  return id.replace(/\s/g, '').toLowerCase();
 }
 
 /**

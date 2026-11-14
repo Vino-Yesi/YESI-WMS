@@ -1,4 +1,3 @@
-import { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
 
 interface KineticCounterProps {
@@ -7,13 +6,7 @@ interface KineticCounterProps {
 }
 
 export default function KineticCounter({ value, size = 60 }: KineticCounterProps) {
-  const [displayValue, setDisplayValue] = useState(0);
-
-  useEffect(() => {
-    setDisplayValue(value);
-  }, [value]);
-
-  const digits = displayValue.toLocaleString().split('');
+  const digits = value.toLocaleString().split('');
 
   return (
     <div
@@ -39,7 +32,7 @@ export default function KineticCounter({ value, size = 60 }: KineticCounterProps
               animate={{ y: 0 }}
               transition={{ type: 'spring', stiffness: 300, damping: 20 }}
             >
-              {parseInt(char)}
+              {parseInt(char, 10)}
             </motion.div>
           )}
         </span>

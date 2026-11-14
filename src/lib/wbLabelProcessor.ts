@@ -17,6 +17,17 @@
  */
 
 import * as pdfjsLib from 'pdfjs-dist';
+import {
+  extractTracking,
+  extractOrderId,
+  extractPhone,
+  extractCode,
+  extractAddress,
+  parseQrPayload,
+  scoreWbIndicators,
+  WB_TRACKING_RE_G,
+  type WBLabelData,
+} from './wbLabelMatcher';
 
 // Re-export the entire pure engine so consumers can import from this module.
 export * from './wbLabelMatcher';
@@ -81,21 +92,18 @@ export async function processPdf(
   _pdfBytes: ArrayBuffer,
   pdfDoc: PdfDocument,
   options: ProcessPdfOptions = {},
-): Promise<import('./wbLabelMatcher').WBLabelData[]> {
+): Promise<WBLabelData[]> {
   const { detectBarcodes = true, onProgress } = options;
-  // Imported lazily to keep the pure matcher free of pdfjs at module load.
-  const { extractTracking, extractOrderId, extractPhone, extractCode, extractAddress, parseQrPayload, scoreWbIndicators, WB_TRACKING_RE_G } =
-    await import('./wbLabelMatcher');
   const detector = detectBarcodes ? getBarcodeDetector() : null;
   const numPages = pdfDoc.numPages;
-  const results: import('./wbLabelMatcher').WBLabelData[] = [];
+  const results: WBLabelData[] = [];
 
   for (let i = 1; i <= numPages; i++) {
     const page = await pdfDoc.getPage(i);
     const textContent = await page.getTextContent();
     const text = textContent.items.map((item) => ('str' in item ? (item as { str: string }).str : '')).join(' ');
 
-    const data: import('./wbLabelMatcher').WBLabelData = {
+    const data: WBLabelData = {
       pageIdx: i - 1,
       trackingNumber: null,
       wbOrderId: null,
@@ -161,7 +169,7 @@ export async function processPdf(
 export async function loadAndProcessPdf(
   arrayBuffer: ArrayBuffer,
   options?: ProcessPdfOptions,
-): Promise<{ doc: PdfDocument; data: import('./wbLabelMatcher').WBLabelData[] }> {
+): Promise<{ doc: PdfDocument; data: WBLabelData[] }> {
   const doc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
   const data = await processPdf(arrayBuffer.slice(0), doc, options);
   return { doc, data };

@@ -1,5 +1,7 @@
 import Dexie, { type Table } from 'dexie';
 import waveData from '@/data/ozon-wave.json';
+import { hashPasswordLocal, isHashedSecret } from './security';
+import { enqueueCloudOperation } from './supabaseSync';
 
 // ─── Existing interfaces (enhanced) ─────────────────────────────────────
 export interface InventoryItem {
@@ -721,7 +723,7 @@ class VortexDB extends Dexie {
 
 export const db = new VortexDB();
 
-// Audit log helper
+// Audit log helper (writes locally + queues cloud audit trail)
 export async function logAction(action: string, details: string, operator: string) {
   await db.auditLogs.add({
     action,
@@ -729,6 +731,7 @@ export async function logAction(action: string, details: string, operator: strin
     operator,
     timestamp: new Date().toISOString(),
   });
+  void enqueueCloudOperation('audit_log', { action, details, operator }).catch(() => {});
 }
 
 /** Normalize template raw key for matching */
@@ -802,7 +805,7 @@ export async function upsertTemplatesBulk(
 
 
 
-// Inventory movement logger
+// Inventory movement logger (writes local movement + ACID cloud inventory ledger)
 export async function logInventoryMovement(
   sku: string,
   type: InventoryMovement['type'],
@@ -822,6 +825,23 @@ export async function logInventoryMovement(
     note: opts?.note,
     timestamp: new Date().toISOString(),
   });
+
+  const negativeTypes = new Set(['outbound', 'pick', 'pack']);
+  const qtyDelta = negativeTypes.has(type) ? -Math.abs(quantity) : Math.abs(quantity);
+  const location = opts?.toLocation || opts?.fromLocation || 'PHONE-A-01';
+  const mappedTx = type === 'qc_adjustment' ? 'qc_release' : type;
+
+  void enqueueCloudOperation('stock_movement', {
+    sku,
+    qtyDelta,
+    transactionType: mappedTx,
+    location,
+    lotNumber: opts?.lotNumber || 'DEFAULT',
+    referenceType: opts?.orderId ? 'ORDER' : 'MANUAL',
+    referenceId: opts?.orderId || null,
+    operator,
+    note: opts?.note || null,
+  }).catch(() => {});
 }
 
 // Export all data as JSON
@@ -872,17 +892,32 @@ export async function exportAllData() {
   };
 }
 
-// Seed data function
+// Seed data function (PBKDF2-SHA256 hashed credentials + opening stock)
 export async function seedDatabase() {
   const now = new Date().toISOString();
   const usersCount = await db.users.count();
   if (usersCount === 0) {
-    await db.users.bulkAdd([
-      { username: "admin", password: "admin", role: "admin", displayName: "Administrator", createdAt: now, skillLevel: 5 },
-      { username: "VINOVJ", password: "VINOVJ", role: "admin", displayName: "Vino VJ", createdAt: now, skillLevel: 5 },
-      { username: "operator", password: "operator", role: "operator", displayName: "Floor Operator", createdAt: now, skillLevel: 3 },
-      { username: "supervisor", password: "supervisor", role: "supervisor", displayName: "Shift Supervisor", createdAt: now, skillLevel: 4 },
+    const [adminHash, vinoHash, opHash, supHash] = await Promise.all([
+      hashPasswordLocal('admin'),
+      hashPasswordLocal('VINOVJ'),
+      hashPasswordLocal('operator'),
+      hashPasswordLocal('supervisor'),
     ]);
+    await db.users.bulkAdd([
+      { username: 'admin', password: adminHash, role: 'admin', displayName: 'Administrator', createdAt: now, skillLevel: 5 },
+      { username: 'VINOVJ', password: vinoHash, role: 'admin', displayName: 'Vino VJ', createdAt: now, skillLevel: 5 },
+      { username: 'operator', password: opHash, role: 'operator', displayName: 'Floor Operator', createdAt: now, skillLevel: 3 },
+      { username: 'supervisor', password: supHash, role: 'supervisor', displayName: 'Shift Supervisor', createdAt: now, skillLevel: 4 },
+    ]);
+  } else {
+    // Migrate any legacy plaintext passwords in IndexedDB to PBKDF2-SHA256
+    const existingUsers = await db.users.toArray();
+    for (const u of existingUsers) {
+      if (u.id != null && !isHashedSecret(u.password)) {
+        const hashed = await hashPasswordLocal(u.password);
+        await db.users.update(u.id, { password: hashed });
+      }
+    }
   }
 
   const invCount = await db.inventory.count();

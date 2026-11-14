@@ -95,7 +95,17 @@ export default defineConfig({
         ]
       : []),
   ],
-  server: { port: 3000, strictPort: true },
+  server: {
+    host: '0.0.0.0',
+    port: 3000,
+    strictPort: true,
+    allowedHosts: true,
+  },
+  preview: {
+    host: '0.0.0.0',
+    port: 4173,
+    allowedHosts: true,
+  },
   envPrefix: ['VITE_', 'TAURI_'],
   clearScreen: false,
   resolve: { alias: { "@": path.resolve(__dirname, "./src") } },
@@ -110,6 +120,7 @@ export default defineConfig({
           if (!id.includes('node_modules')) return;
           if (id.includes('pdfjs-dist') || id.includes('pdf-lib')) return 'vendor-pdf';
           if (id.includes('html5-qrcode')) return 'vendor-scanner';
+          if (id.includes('@supabase/supabase-js') || id.includes('@supabase/')) return 'vendor-supabase';
           if (id.includes('framer-motion') || id.includes('lucide-react')) return 'vendor-ui';
           if (
             id.includes('recharts') ||
