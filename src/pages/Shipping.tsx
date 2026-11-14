@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { db, logAction } from '@/lib/db';
+import { enqueueCloudOperation } from '@/lib/supabaseSync';
 import { useAuth } from '@/lib/auth';
 import {
   Truck, DollarSign, Package, Printer, Barcode, MapPin, CheckCircle,
@@ -240,6 +241,12 @@ export default function Shipping() {
     if (user) {
       await logAction('ORDER_SHIPPED', `Shipped ${selectedOrder.orderId} via ${selectedRate.carrier} ${selectedRate.service}`, user.displayName);
     }
+    void enqueueCloudOperation('dispatch_order', {
+      orderId: selectedOrder.orderId,
+      carrier: selectedRate.carrier,
+      trackingNumber: generatedLabel.trackingNumber,
+      operator: user?.displayName || 'Operator',
+    }).catch(() => {});
   };
 
   const handleTrack = (order: Order) => {

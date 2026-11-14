@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+
+scrape_configs:
+  - job_name: 'yesi-wms-supabase-edge'
+    scheme: https
+    metrics_path: '/functions/v1/wms-api'
+    params:
+      action: ['metrics']
+    static_configs:
+      - targets: ['xtbbnnwthhngapmxqyis.supabase.co']

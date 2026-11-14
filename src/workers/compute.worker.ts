@@ -198,11 +198,13 @@ self.onmessage = (ev: MessageEvent<WorkerRequest>) => {
       self.postMessage(res);
       return;
     }
-    self.postMessage({ id: (msg as any).id, type: (msg as any).type, ok: false, error: 'Unknown type' });
+    const fallback = msg as { id?: string; type?: string };
+    self.postMessage({ id: fallback.id || '', type: fallback.type || 'UNKNOWN', ok: false, error: 'Unknown type' });
   } catch (e) {
+    const fallback = msg as { id?: string; type?: string };
     self.postMessage({
-      id: (msg as any).id,
-      type: (msg as any).type,
+      id: fallback.id || '',
+      type: fallback.type || 'ERROR',
       ok: false,
       error: e instanceof Error ? e.message : String(e),
     });

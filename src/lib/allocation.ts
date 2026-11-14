@@ -1,4 +1,5 @@
 import { db, logAction, logInventoryMovement } from './db';
+import { enqueueCloudOperation } from './supabaseSync';
 import type { InventoryReservation, Order } from './db';
 
 export type { InventoryReservation };
@@ -77,6 +78,10 @@ export async function allocateOrder(
   const success = conflicts.length === 0;
   if (success) {
     await logAction('ALLOCATE_ORDER', `Reserved inventory for ${order.orderId}: ${reservations.map(r => `${r.sku}×${r.quantity}`).join(', ')}`, operator);
+    void enqueueCloudOperation('allocate_order', {
+      orderId: order.orderId,
+      operator,
+    }).catch(() => {});
   }
 
   return {

@@ -45,13 +45,13 @@ export async function saveOperatorStats(stats: OperatorStats): Promise<void> {
   try {
     const existing = await db.preferences.where('key').equals(key).first();
     if (existing?.id != null) {
-      await db.preferences.update(existing.id, { value: serialized, createdAt: new Date().toISOString() } as any);
+      await db.preferences.update(existing.id, { value: serialized, createdAt: new Date().toISOString() });
     } else {
       await db.preferences.add({
         key,
         value: serialized,
         createdAt: new Date().toISOString(),
-      } as any);
+      });
     }
   } catch {
     /* quota */

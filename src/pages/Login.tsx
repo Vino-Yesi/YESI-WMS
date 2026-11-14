@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useAuth } from '@/lib/auth';
 import { Eye, EyeOff, Hexagon, Sparkles, Shield, Zap, Package } from 'lucide-react';
@@ -9,12 +9,12 @@ function Starfield() {
     () =>
       Array.from({ length: 60 }, (_, i) => ({
         id: i,
-        x: Math.random() * 100,
-        y: Math.random() * 100,
-        r: Math.random() * 1.6 + 0.4,
-        d: Math.random() * 4 + 2,
-        delay: Math.random() * 5,
-        o: Math.random() * 0.5 + 0.25,
+        x: ((i * 37) % 97) + 1.5,
+        y: ((i * 53) % 95) + 2,
+        r: ((i % 5) * 0.3) + 0.5,
+        d: (i % 4) + 2.5,
+        delay: (i % 7) * 0.6,
+        o: ((i % 5) * 0.1) + 0.25,
       })),
     []
   );

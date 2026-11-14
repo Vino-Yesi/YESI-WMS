@@ -1,9 +1,9 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { motion } from 'framer-motion';
 import { db, exportAllData, logAction } from '@/lib/db';
 import { useAuth } from '@/lib/auth';
 import { User, Download, Upload, Trash2, AlertTriangle, Database, Activity, Rows3, Maximize2 } from 'lucide-react';
-import { useAppStore, type DensityMode } from '@/lib/store';
+import { useAppStore } from '@/lib/store';
 
 export default function SettingsPage() {
   const { user, updateUser } = useAuth();
@@ -18,15 +18,7 @@ export default function SettingsPage() {
   });
   const [showResetConfirm, setShowResetConfirm] = useState(false);
 
-  useEffect(() => {
-    loadStats();
-  }, []);
-
-  useEffect(() => {
-    if (user?.displayName) setDisplayName(user.displayName);
-  }, [user?.displayName]);
-
-  const loadStats = async () => {
+  const loadStats = useCallback(async () => {
     const [inv, ord, ret, inb, logs, movements, cycleCounts, tasks, replenishments, qcHolds, waves] = await Promise.all([
       db.inventory.count(),
       db.orders.count(),
@@ -44,12 +36,18 @@ export default function SettingsPage() {
       inventory: inv, orders: ord, returns: ret, inbound: inb, logs,
       movements, cycleCounts, tasks, replenishments, qcHolds, waves,
     });
-  };
+  }, []);
+
+  useEffect(() => {
+    void loadStats();
+  }, [loadStats]);
 
   const handleUpdateProfile = async () => {
     if (!user) return;
     try {
-      await db.users.update(user.id, { displayName });
+      if (typeof user.id === 'number') {
+        await db.users.update(user.id, { displayName });
+      }
       updateUser({ displayName });
       await logAction('PROFILE_UPDATE', `Updated display name to ${displayName}`, displayName);
       setMessage({ type: 'success', text: 'Profile updated successfully' });

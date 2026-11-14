@@ -2,6 +2,8 @@ import { useState, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { db, logAction } from '@/lib/db';
 import { useAuth } from '@/lib/auth';
+import { hashPasswordLocal } from '@/lib/security';
+import { supabase, WMS_TENANT_CODE } from '@/lib/supabase';
 import {
   Users, Plus, Shield, User, Trash2, X, UserCog, ScrollText, Clock, Pencil, KeyRound, Check,
 } from 'lucide-react';
@@ -65,12 +67,21 @@ export default function UserManagement() {
     }
 
     try {
+      const hashedPassword = await hashPasswordLocal(newUser.password);
       await db.users.add({
         username: newUser.username.trim(),
-        password: newUser.password,
+        password: hashedPassword,
         role: newUser.role,
         displayName: newUser.displayName.trim() || newUser.username.trim(),
         createdAt: new Date().toISOString(),
+      });
+      void supabase.rpc('wms_upsert_user_secure', {
+        p_username: newUser.username.trim(),
+        p_display_name: newUser.displayName.trim() || newUser.username.trim(),
+        p_role: newUser.role,
+        p_password: newUser.password,
+        p_operator: operatorName,
+        p_tenant_code: WMS_TENANT_CODE,
       });
       await logAction(
         'USER_CREATE',
@@ -112,7 +123,7 @@ export default function UserManagement() {
         setMessage({ type: 'error', text: 'Password must be at least 4 characters' });
         return;
       }
-      updates.password = editForm.password.trim();
+      updates.password = await hashPasswordLocal(editForm.password.trim());
     }
 
     // Prevent locking yourself out of admin
@@ -127,6 +138,14 @@ export default function UserManagement() {
 
     try {
       await db.users.update(editingId, updates);
+      void supabase.rpc('wms_upsert_user_secure', {
+        p_username: target.username,
+        p_display_name: editForm.displayName.trim() || target.username,
+        p_role: editForm.role,
+        p_password: editForm.password.trim() || null,
+        p_operator: operatorName,
+        p_tenant_code: WMS_TENANT_CODE,
+      });
       await logAction(
         'USER_UPDATE',
         `Updated ${target.username}: role=${editForm.role}${editForm.password ? ', password reset' : ''}`,

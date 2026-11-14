@@ -37,13 +37,18 @@ test.describe('WMS smoke flow', () => {
     await expect(page).toHaveURL(/\/($|\?)/, { timeout: 20_000 });
     await page.waitForTimeout(800);
 
-    // Navigate via sidebar / routes
+    // Navigate via sidebar / routes across all 12 WMS domains
     const routes = [
+      { path: '/dock', hint: /dock|appointment/i },
       { path: '/inbound', hint: /inbound|receiving/i },
+      { path: '/putaway', hint: /putaway/i },
+      { path: '/qc', hint: /qc|quality|hold/i },
+      { path: '/inventory', hint: /inventory|sku/i },
       { path: '/pick-pack', hint: /pick|pack/i },
       { path: '/shipping', hint: /ship/i },
+      { path: '/returns', hint: /return/i },
+      { path: '/cloud', hint: /cloud|postgresql|ledger/i },
       { path: '/guardian', hint: /guardian|critical|scenario/i },
-      { path: '/inventory', hint: /inventory|sku/i },
     ];
 
     for (const r of routes) {
