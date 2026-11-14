@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router-dom';
 import { useAppStore } from '@/lib/store';
 import { processUserMessage, SUGGESTED_PROMPTS, type ChatMessage } from '@/lib/aiAssistant';
 import { Bot, X, Send, Sparkles, Minimize2, Maximize2 } from 'lucide-react';
+import { safeRandomId } from '@/lib/safeStorage';
 
 export default function AIAssistant() {
   const navigate = useNavigate();
@@ -30,7 +31,7 @@ export default function AIAssistant() {
 
     const nowTs = performance.now() >= 0 ? new Date().getTime() : 0;
     const userMsg: ChatMessage = {
-      id: crypto.randomUUID(),
+      id: safeRandomId(),
       role: 'user',
       content: msg,
       timestamp: nowTs,
@@ -42,7 +43,7 @@ export default function AIAssistant() {
     try {
       const response = await processUserMessage(msg);
       const assistantMsg: ChatMessage = {
-        id: crypto.randomUUID(),
+        id: safeRandomId(),
         role: 'assistant',
         content: response.content,
         timestamp: new Date().getTime(),
@@ -51,7 +52,7 @@ export default function AIAssistant() {
       addChatMessage(assistantMsg);
     } catch {
       addChatMessage({
-        id: crypto.randomUUID(),
+        id: safeRandomId(),
         role: 'assistant',
         content: 'Sorry, I encountered an error processing your request. Please try again.',
         timestamp: new Date().getTime(),

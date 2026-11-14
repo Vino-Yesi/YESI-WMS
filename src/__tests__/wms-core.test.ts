@@ -24,6 +24,8 @@ import { validateRuntimeConfig } from '@/lib/config';
 import { validateOutboxPayload, computeBackoffMs } from '@/lib/supabaseSync';
 import { validateScan, buildSummary, type ExpectedLine } from '@/lib/scanValidation';
 import { routeOptimizer, oracle, sentinel } from '@/lib/neuralOps';
+import { safeLocalStorage, safeSessionStorage } from '@/lib/safeStorage';
+import { useAppStore } from '@/lib/store';
 
 describe('WMS Runtime Config & Secret Guardrails', () => {
   it('gracefully enters isolated Offline-Edge Mode when cloud env vars are missing', () => {
@@ -184,5 +186,36 @@ describe('WMS Quantum Route Optimizer, Oracle Forecast & Anomaly Sentinel', () =
       [{ status: 'Open' }]
     );
     expect(alerts.some((a) => a.sku === 'SKU-NEG')).toBe(true);
+  });
+});
+
+describe('Sandboxed Iframe Storage Resilience (safeStorage & Zustand Persist)', () => {
+  it('never throws SecurityError when localStorage / sessionStorage are blocked in cross-origin iframes', () => {
+    const throwingStorage: Storage = {
+      length: 0,
+      clear() { throw new DOMException('', 'SecurityError'); },
+      getItem() { throw new DOMException('', 'SecurityError'); },
+      key() { throw new DOMException('', 'SecurityError'); },
+      removeItem() { throw new DOMException('', 'SecurityError'); },
+      setItem() { throw new DOMException('', 'SecurityError'); },
+    };
+
+    vi.stubGlobal('window', {
+      localStorage: throwingStorage,
+      sessionStorage: throwingStorage,
+    });
+
+    expect(() => safeLocalStorage.setItem('test_k', 'v1')).not.toThrow();
+    expect(safeLocalStorage.getItem('test_k')).toBe('v1');
+    expect(() => safeSessionStorage.setItem('sess_k', 's1')).not.toThrow();
+    expect(safeSessionStorage.getItem('sess_k')).toBe('s1');
+
+    // Mutating Zustand store actions under blocked Web Storage must never throw or crash React
+    expect(() => useAppStore.getState().setAiAssistantOpen(true)).not.toThrow();
+    expect(useAppStore.getState().aiAssistantOpen).toBe(true);
+    expect(() => useAppStore.getState().setDensity('comfortable')).not.toThrow();
+    expect(useAppStore.getState().density).toBe('comfortable');
+
+    vi.unstubAllGlobals();
   });
 });

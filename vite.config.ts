@@ -110,7 +110,10 @@ export default defineConfig(({ command }) => ({
   },
   envPrefix: ['VITE_', 'TAURI_'],
   clearScreen: false,
-  resolve: { alias: { "@": path.resolve(__dirname, "./src") } },
+  resolve: {
+    alias: { "@": path.resolve(__dirname, "./src") },
+    dedupe: ['react', 'react-dom', 'react-router', 'react-router-dom'],
+  },
   build: {
     target: process.env.TAURI_ENV_PLATFORM === 'windows' ? 'chrome105' : 'safari13',
     minify: !process.env.TAURI_ENV_DEBUG ? 'esbuild' : false,

@@ -1,4 +1,4 @@
-import { Routes, Route, Navigate, useLocation } from 'react-router-dom';
+import { Routes, Route, Navigate } from 'react-router-dom';
 import { AuthProvider, useAuth } from '@/lib/auth';
 import { seedDatabase } from '@/lib/db';
 import { startHybridSyncEngine, setActiveWarehouseCode } from '@/lib/supabaseSync';
@@ -139,8 +139,7 @@ function AuthenticatedSyncOrchestrator() {
 }
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
-  const { user, loading, canAccessModule } = useAuth();
-  const location = useLocation();
+  const { user, loading } = useAuth();
 
   if (loading) {
     return (
@@ -151,12 +150,6 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
   }
   if (!user) return <Navigate to="/login" replace />;
 
-  // Enforce route-level RBAC check as a defense-in-depth gate
-  if (!canAccessModule(location.pathname) && location.pathname !== '/') {
-    return (
-      <Layout />
-    );
-  }
   return <>{children}</>;
 }
 

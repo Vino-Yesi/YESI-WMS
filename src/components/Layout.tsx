@@ -4,6 +4,7 @@ import Sidebar, { useSidebarWidthPx } from './Sidebar';
 import TopBar from './TopBar';
 import QuickNotes from './QuickNotes';
 import { useAppStore } from '@/lib/store';
+import { safeMatchMedia } from '@/lib/safeStorage';
 
 export default function Layout() {
   const location = useLocation();
@@ -38,7 +39,7 @@ export default function Layout() {
   useEffect(() => {
     const standalone =
       (window.navigator as Navigator & { standalone?: boolean }).standalone === true ||
-      window.matchMedia('(display-mode: standalone)').matches;
+      safeMatchMedia('(display-mode: standalone)');
     document.body.classList.toggle('pwa-standalone', standalone);
     return () => document.body.classList.remove('pwa-standalone');
   }, []);

@@ -124,7 +124,7 @@ export async function verifyPasswordLocal(password: string, stored: string): Pro
 let fallbackMemoryKey: CryptoKey | null = null;
 
 async function getOrCreateSessionCryptoKey(): Promise<CryptoKey> {
-  if (typeof indexedDB === 'undefined') {
+  const getFallbackKey = async () => {
     if (!fallbackMemoryKey) {
       fallbackMemoryKey = await crypto.subtle.generateKey(
         { name: 'AES-GCM', length: 256 },
@@ -133,55 +133,69 @@ async function getOrCreateSessionCryptoKey(): Promise<CryptoKey> {
       );
     }
     return fallbackMemoryKey;
+  };
+
+  if (typeof indexedDB === 'undefined') {
+    return getFallbackKey();
   }
 
-  return new Promise<CryptoKey>((resolve, reject) => {
-    const req = indexedDB.open(KEY_DB_NAME, 1);
-    req.onupgradeneeded = () => {
-      const idb = req.result;
-      if (!idb.objectStoreNames.contains(KEY_STORE_NAME)) {
-        idb.createObjectStore(KEY_STORE_NAME);
+  try {
+    return await new Promise<CryptoKey>((resolve, reject) => {
+      let req: IDBOpenDBRequest;
+      try {
+        req = indexedDB.open(KEY_DB_NAME, 1);
+      } catch (err) {
+        reject(err);
+        return;
       }
-    };
-    req.onerror = () => reject(req.error);
-    req.onsuccess = () => {
-      const idb = req.result;
-      const tx = idb.transaction(KEY_STORE_NAME, 'readonly');
-      const getReq = tx.objectStore(KEY_STORE_NAME).get(SESSION_KEY_ID);
-      getReq.onsuccess = async () => {
-        if (getReq.result) {
-          idb.close();
-          resolve(getReq.result as CryptoKey);
-          return;
-        }
-        try {
-          // Non-extractable key: raw key bytes cannot be exported even by JS
-          const newKey = await crypto.subtle.generateKey(
-            { name: 'AES-GCM', length: 256 },
-            false,
-            ['encrypt', 'decrypt']
-          );
-          const writeTx = idb.transaction(KEY_STORE_NAME, 'readwrite');
-          writeTx.objectStore(KEY_STORE_NAME).put(newKey, SESSION_KEY_ID);
-          writeTx.oncomplete = () => {
-            idb.close();
-            resolve(newKey);
-          };
-          writeTx.onerror = () => {
-            idb.close();
-            resolve(newKey);
-          };
-        } catch (err) {
-          idb.close();
-          reject(err);
+      req.onupgradeneeded = () => {
+        const idb = req.result;
+        if (!idb.objectStoreNames.contains(KEY_STORE_NAME)) {
+          idb.createObjectStore(KEY_STORE_NAME);
         }
       };
-      getReq.onerror = () => {
-        idb.close();
-        reject(getReq.error);
+      req.onerror = () => reject(req.error);
+      req.onsuccess = () => {
+        const idb = req.result;
+        const tx = idb.transaction(KEY_STORE_NAME, 'readonly');
+        const getReq = tx.objectStore(KEY_STORE_NAME).get(SESSION_KEY_ID);
+        getReq.onsuccess = async () => {
+          if (getReq.result) {
+            idb.close();
+            resolve(getReq.result as CryptoKey);
+            return;
+          }
+          try {
+            // Non-extractable key: raw key bytes cannot be exported even by JS
+            const newKey = await crypto.subtle.generateKey(
+              { name: 'AES-GCM', length: 256 },
+              false,
+              ['encrypt', 'decrypt']
+            );
+            const writeTx = idb.transaction(KEY_STORE_NAME, 'readwrite');
+            writeTx.objectStore(KEY_STORE_NAME).put(newKey, SESSION_KEY_ID);
+            writeTx.oncomplete = () => {
+              idb.close();
+              resolve(newKey);
+            };
+            writeTx.onerror = () => {
+              idb.close();
+              resolve(newKey);
+            };
+          } catch (err) {
+            idb.close();
+            reject(err);
+          }
+        };
+        getReq.onerror = () => {
+          idb.close();
+          reject(getReq.error);
+        };
       };
-    };
-  });
+    });
+  } catch {
+    return getFallbackKey();
+  }
 }
 
 export async function encryptSessionEnvelope(payload: unknown): Promise<string> {

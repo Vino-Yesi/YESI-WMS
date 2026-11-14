@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { db, logAction } from '@/lib/db';
+import { safeLocalStorage } from '@/lib/safeStorage';
 import { receiveInboundTransactional } from '@/lib/lifecycle';
 import { useAuth } from '@/lib/auth';
 import BarcodeReader from '@/components/BarcodeReader';
@@ -133,7 +134,7 @@ export default function InboundReceiving() {
 
   const [gSheetLinks, setGSheetLinks] = useState<{ clientName: string; url: string; addedAt: string }[]>(() => {
     try {
-      const saved = localStorage.getItem('vortex_g_sheet_links');
+      const saved = safeLocalStorage.getItem('vortex_g_sheet_links');
       return saved ? JSON.parse(saved) : [];
     } catch { return []; }
   });
@@ -153,7 +154,7 @@ export default function InboundReceiving() {
   }, [loadRecent]);
 
   useEffect(() => {
-    localStorage.setItem('vortex_g_sheet_links', JSON.stringify(gSheetLinks));
+    safeLocalStorage.setItem('vortex_g_sheet_links', JSON.stringify(gSheetLinks));
   }, [gSheetLinks]);
 
   const handleAddGSheet = () => {

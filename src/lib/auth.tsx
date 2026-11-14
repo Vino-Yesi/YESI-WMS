@@ -1,6 +1,6 @@
 /* eslint-disable react-refresh/only-export-components */
 import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
-import { db, logAction } from './db';
+import { db, logAction, type User } from './db';
 import {
   hashPasswordLocal,
   verifyPasswordLocal,
@@ -19,6 +19,7 @@ import {
   setActiveServerSessionToken,
   getActiveServerSessionToken,
 } from './supabase';
+import { safeLocalStorage, safeSessionStorage, safeRandomId } from './safeStorage';
 
 export interface AuthUser {
   id: number | string;
@@ -89,16 +90,12 @@ const LEGACY_LOCALSTORAGE_KEY = 'vortex_session';
 const LOCKOUT_PREF_PREFIX = 'auth_lockout:';
 
 function getDeviceId(): string {
-  try {
-    let id = sessionStorage.getItem('yesi_device_id');
-    if (!id) {
-      id = `dev-${crypto.randomUUID().slice(0, 12)}`;
-      sessionStorage.setItem('yesi_device_id', id);
-    }
-    return id;
-  } catch {
-    return 'edge-terminal';
+  let id = safeSessionStorage.getItem('yesi_device_id');
+  if (!id) {
+    id = `dev-${safeRandomId().slice(0, 12)}`;
+    safeSessionStorage.setItem('yesi_device_id', id);
   }
+  return id;
 }
 
 async function getLocalLockout(username: string): Promise<LockoutRecord> {
@@ -135,7 +132,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<AuthUser | null>(null);
   const [loading, setLoading] = useState(true);
   const [lastAuthError, setLastAuthError] = useState<string | null>(null);
-  const [lastActivity, setLastActivity] = useState(() => Date.now());
+  const lastActivityRef = useRef<number>(Date.now());
   const userRef = useRef<AuthUser | null>(null);
 
   useEffect(() => {
@@ -143,12 +140,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [user]);
 
   const clearClientSession = useCallback(() => {
-    try {
-      sessionStorage.removeItem(SESSION_STORAGE_KEY);
-      localStorage.removeItem(LEGACY_LOCALSTORAGE_KEY);
-    } catch {
-      // ignore storage errors
-    }
+    safeSessionStorage.removeItem(SESSION_STORAGE_KEY);
+    safeLocalStorage.removeItem(LEGACY_LOCALSTORAGE_KEY);
     setActiveServerSessionToken(null);
     setUser(null);
   }, []);
@@ -164,14 +157,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     };
     setActiveServerSessionToken(serverToken);
     try {
-      localStorage.removeItem(LEGACY_LOCALSTORAGE_KEY);
+      safeLocalStorage.removeItem(LEGACY_LOCALSTORAGE_KEY);
       const encrypted = await encryptSessionEnvelope(payload);
-      sessionStorage.setItem(SESSION_STORAGE_KEY, encrypted);
+      safeSessionStorage.setItem(SESSION_STORAGE_KEY, encrypted);
     } catch {
       // Keep in-memory session even if storage quota/crypto fails
     }
     setUser(sessionUser);
-    setLastActivity(Date.now());
+    lastActivityRef.current = Date.now();
   }, []);
 
   // Restore & strictly validate encrypted session on startup
@@ -180,9 +173,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     async function restoreSession() {
       try {
         // Purge any legacy plaintext localStorage session immediately
-        localStorage.removeItem(LEGACY_LOCALSTORAGE_KEY);
+        safeLocalStorage.removeItem(LEGACY_LOCALSTORAGE_KEY);
 
-        const raw = sessionStorage.getItem(SESSION_STORAGE_KEY);
+        const raw = safeSessionStorage.getItem(SESSION_STORAGE_KEY);
         if (!raw) {
           if (!cancelled) setLoading(false);
           return;
@@ -253,12 +246,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     clearClientSession();
   }, [clearClientSession]);
 
-  // Rolling inactivity session timeout
+  // Rolling inactivity session timeout (tracked via ref to ensure zero React re-renders on floor pointer/scroll activity)
   useEffect(() => {
     if (!user) return;
+    lastActivityRef.current = Date.now();
 
     const checkTimeout = () => {
-      const inactive = Date.now() - lastActivity;
+      const inactive = Date.now() - lastActivityRef.current;
       if (inactive > SESSION_TIMEOUT_MINUTES * 60 * 1000) {
         void logAction('SESSION_EXPIRED', `Inactivity timeout for ${user.username}`, user.displayName);
         logout();
@@ -267,14 +261,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     const interval = setInterval(checkTimeout, 30_000);
     const activityEvents = ['mousedown', 'keydown', 'touchstart', 'scroll'];
-    const updateActivity = () => setLastActivity(Date.now());
+    const updateActivity = () => {
+      lastActivityRef.current = Date.now();
+    };
     activityEvents.forEach((e) => window.addEventListener(e, updateActivity, { passive: true }));
 
     return () => {
       clearInterval(interval);
       activityEvents.forEach((e) => window.removeEventListener(e, updateActivity));
     };
-  }, [user, lastActivity, logout]);
+  }, [user, logout]);
 
   const loginDetailed = useCallback(
     async (username: string, password: string, requestedWarehouse?: string): Promise<LoginOutcome> => {
@@ -345,30 +341,34 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
                 ? u.allowedWarehouses
                 : [u.warehouseCode || targetWh];
 
-              // Mirror PBKDF2-SHA256 credential into local IndexedDB for verified offline Continuity-of-Operations
-              const localHash = await hashPasswordLocal(password);
-              const allLocal = await db.users.toArray();
-              const localMatch = allLocal.find((x) => x.username.toLowerCase() === cleanUser.toLowerCase());
-              const persistedRole: 'admin' | 'supervisor' | 'operator' =
-                mappedRole === 'admin' || mappedRole === 'supervisor' ? mappedRole : 'operator';
+              // Mirror PBKDF2-SHA256 credential into local IndexedDB when available (never abort cloud login if IndexedDB is blocked in cross-origin iframe)
               let localId: number | string = u.id;
-              if (localMatch?.id != null) {
-                await db.users.update(localMatch.id, {
-                  password: localHash,
-                  role: persistedRole,
-                  displayName: u.displayName || cleanUser,
-                });
-                localId = localMatch.id;
-              } else {
-                localId = await db.users.add({
-                  username: u.username || cleanUser,
-                  password: localHash,
-                  role: persistedRole,
-                  displayName: u.displayName || cleanUser,
-                  createdAt: new Date().toISOString(),
-                  skillLevel: Number(u.skillLevel || 3),
-                  currentZone: u.currentZone || 'PHONE-A',
-                });
+              try {
+                const localHash = await hashPasswordLocal(password);
+                const allLocal = await db.users.toArray();
+                const localMatch = allLocal.find((x) => x.username.toLowerCase() === cleanUser.toLowerCase());
+                const persistedRole: 'admin' | 'supervisor' | 'operator' =
+                  mappedRole === 'admin' || mappedRole === 'supervisor' ? mappedRole : 'operator';
+                if (localMatch?.id != null) {
+                  await db.users.update(localMatch.id, {
+                    password: localHash,
+                    role: persistedRole,
+                    displayName: u.displayName || cleanUser,
+                  });
+                  localId = localMatch.id;
+                } else {
+                  localId = await db.users.add({
+                    username: u.username || cleanUser,
+                    password: localHash,
+                    role: persistedRole,
+                    displayName: u.displayName || cleanUser,
+                    createdAt: new Date().toISOString(),
+                    skillLevel: Number(u.skillLevel || 3),
+                    currentZone: u.currentZone || 'PHONE-A',
+                  });
+                }
+              } catch {
+                // IndexedDB blocked/unavailable in sandboxed iframe — proceed with verified cloud session
               }
 
               const sessionUser: AuthUser = {
@@ -394,7 +394,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
 
       // 2. Offline Edge Authentication via Web Crypto PBKDF2-SHA256
-      const allUsers = await db.users.toArray();
+      let allUsers: User[] = [];
+      try {
+        allUsers = await db.users.toArray();
+      } catch {
+        // IndexedDB blocked/unavailable
+      }
       const found = allUsers.find((u) => u.username.toLowerCase() === cleanUser.toLowerCase());
 
       if (found && found.id != null) {
