@@ -183,6 +183,37 @@ npx playwright install --with-deps chromium
 npm run test:e2e
 ```
 
+The Playwright smoke test drives the **real first-run path**: it boots a fresh
+browser profile with no seeded logins, expects the login screen to report that no
+administrator exists, creates one through the bootstrap form, then walks the ten
+core lifecycle routes and asserts the encrypted session survives a reload. It
+hard-codes no credentials — the password is generated per run.
+
+#### Secret scanning in CI
+
+Two independent scanners run, and they answer different questions:
+
+| Scanner | Scope | Blocks? |
+| :--- | :--- | :--- |
+| `npm run check:security` (`scripts/security-check.mjs`) | Every git-tracked file in the working tree: client secret keys, service-role JWTs, insecure session writes | Yes, on every push and PR |
+| `scripts/gitleaks-ci.sh <version> range` | Only the commits introduced by the event (`base..HEAD`, or the tip commit when a branch is brand new) | Yes, on every push and PR |
+| `scripts/gitleaks-ci.sh <version> history` | **Every commit ever made** | Advisory: nightly + `workflow_dispatch`, `continue-on-error: true`, JSON report uploaded as an artifact |
+
+The pinned gitleaks CLI is used instead of `gitleaks/gitleaks-action@v2`. That
+action decides whether it may run by asking the GitHub API for the repository
+owner's type and, if the call fails for any reason, falls back to "licence
+required" and exits 1 **without scanning anything** — which made the step fail
+intermittently on this personal-account repository, where no licence is needed.
+It also floats on a mutable tag and adds third-party JS to the pipeline. The
+script pins the version and verifies the archive's SHA-256 against the checksums
+published with the same release, so the scan either runs the exact binary we asked
+for or fails loudly. `GITLEAKS_BIN` is an escape hatch for air-gapped runners; CI
+does not set it.
+
+A historical finding needs a history rewrite plus credential rotation, so it must
+never block an unrelated pull request — hence the advisory nightly job. If it
+reports something, rotate the credential first, then decide about the rewrite.
+
 ---
 
 ### 4. Database Migration & Supabase Edge Function Deployment SOP

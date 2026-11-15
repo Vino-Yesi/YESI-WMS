@@ -5,6 +5,10 @@ on:
     branches: [main, 'arena/**']
   pull_request:
     branches: [main]
+  schedule:
+    # Monday 02:30 UTC — full git-history secret audit (see the last job).
+    - cron: '30 2 * * 1'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -25,11 +29,23 @@ jobs:
         run: npm ci --legacy-peer-deps
       - name: Scan repository for leaked secrets & insecure session writes
         run: npm run check:security
-      - name: Gitleaks git-history secret scan
-        uses: gitleaks/gitleaks-action@v2
+
+      # Pinned gitleaks CLI instead of `gitleaks/gitleaks-action@v2`.
+      #
+      # The action gates itself behind a licence lookup: it asks the GitHub API
+      # for the repo owner's type and, if that call fails for ANY reason, it
+      # falls back to "licence required" and exits 1 with no findings at all —
+      # which made this step fail intermittently on a personal-account repo that
+      # needs no licence. It also floats on a mutable tag and ships third-party
+      # JS into the pipeline. Here the binary version is pinned and its SHA-256
+      # is verified against the checksums published with the same release, and
+      # the result no longer depends on an unrelated API call.
+      - name: Gitleaks secret scan (pinned CLI, commits introduced by this event)
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        continue-on-error: false
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: bash scripts/gitleaks-ci.sh 8.30.1 range "${PR_BASE:-${PUSH_BEFORE:-}}"
+
       - name: Production dependency vulnerability audit (critical)
         run: npm audit --omit=dev --audit-level=critical
 
@@ -79,5 +95,37 @@ jobs:
           cache: 'npm'
       - run: npm ci --legacy-peer-deps
       - run: npx playwright install --with-deps chromium
+      # No VITE_SUPABASE_* here on purpose: the smoke test exercises Offline-Edge
+      # mode, so it drives the real first-run bootstrap flow (no seeded logins).
       - run: npm run build
       - run: npm run test:e2e
+      - name: Upload Playwright screenshots on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-failure-evidence
+          path: test-results/
+          if-no-files-found: ignore
+
+  # The event-range scan above only judges what a branch changes. This job scans
+  # the ENTIRE history so a secret committed months ago cannot hide behind an
+  # unrelated diff. It is advisory (`continue-on-error: true`) because remediating
+  # a historical finding needs a history rewrite plus credential rotation, which
+  # must never block an unrelated pull request; the JSON report is uploaded as an
+  # artifact so findings are actionable rather than silently ignored.
+  gitleaks-full-history:
+    name: Gitleaks Full History Audit (advisory)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan every commit in history
+        run: bash scripts/gitleaks-ci.sh 8.30.1 history
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-full-history-report
+          path: gitleaks-full-history.json
+          if-no-files-found: ignore
