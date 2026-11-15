@@ -100,11 +100,47 @@ esac
 
 if [ "$MODE" = "history" ]; then
   echo "gitleaks-ci: scanning the full git history"
-  # `set -e` propagates gitleaks' exit code: findings fail the step, and the
-  # workflow marks the nightly audit advisory so it never blocks an unrelated PR.
+  rc=0
   "$gitleaks" git . --redact=100 --exit-code=1 \
-    --report-format=json --report-path="$REPORT"
-  exit 0
+    --report-format=json --report-path="$REPORT" || rc=$?
+
+  # An advisory job is worthless if its findings only exist in a log nobody
+  # reads, so publish them as the job summary. `--redact=100` masks the secret
+  # itself, which makes the rule, file, commit and author safe to show.
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ] && [ -s "$REPORT" ]; then
+    GITLEAKS_REPORT="$REPORT" python3 - >>"$GITHUB_STEP_SUMMARY" <<'PY' || true
+import json, os
+
+try:
+    rows = json.load(open(os.environ["GITLEAKS_REPORT"]))
+except Exception as exc:  # a malformed report must not mask the scan result
+    print(f"## Gitleaks full-history audit\n\nReport could not be parsed: {exc}")
+    raise SystemExit(0)
+
+print(f"## Gitleaks full-history audit: {len(rows)} finding(s)")
+print()
+if rows:
+    print("Secrets are redacted below. Rotate anything that was ever real, then")
+    print("decide whether the commit needs to be rewritten out of history.")
+    print()
+    print("| Rule | File | Line | Commit | Author | Date | Entropy |")
+    print("| :-- | :-- | --: | :-- | :-- | :-- | --: |")
+    for r in rows[:200]:
+        print("| `{}` | `{}` | {} | `{}` | {} | {} | {} |".format(
+            r.get("RuleID", ""), r.get("File", ""), r.get("StartLine", ""),
+            (r.get("Commit") or "")[:12], r.get("Author", ""),
+            (r.get("Date") or "")[:10], r.get("Entropy", "")))
+    if len(rows) > 200:
+        print()
+        print(f"_...and {len(rows) - 200} more; see the uploaded JSON artifact._")
+else:
+    print("No secrets found in any commit. Nothing to rotate.")
+PY
+  fi
+
+  # Findings fail the step (the workflow marks this job advisory so an unrelated
+  # pull request is never blocked), and the exit code still tells the truth.
+  exit "$rc"
 fi
 
 if [ -n "$BASE" ] && git cat-file -e "${BASE}^{commit}" 2>/dev/null; then

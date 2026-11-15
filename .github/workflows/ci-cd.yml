@@ -124,7 +124,10 @@ jobs:
           fetch-depth: 0
       - name: Scan every commit in history
         run: bash scripts/gitleaks-ci.sh 8.30.1 history
-      - uses: actions/upload-artifact@v4
+      # `if: always()` matters: the scan step exits non-zero when it finds
+      # something, which is exactly when the report has to be retrievable.
+      - if: always()
+        uses: actions/upload-artifact@v4
         with:
           name: gitleaks-full-history-report
           path: gitleaks-full-history.json
