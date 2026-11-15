@@ -97,7 +97,7 @@ Leaving `VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY` empty is supported: the a
 
 ## Deployment & observability
 
-Full architecture, SOPs and runbooks: [`docs/ARCHITECTURE-AND-OPERATIONS.md`](docs/ARCHITECTURE-AND-OPERATIONS.md). Module-by-module workflow catalog: [`docs/WORKFLOW-AND-DEVELOPER-CATALOG.md`](docs/WORKFLOW-AND-DEVELOPER-CATALOG.md).
+Full architecture, SOPs and runbooks: [`docs/ARCHITECTURE-AND-OPERATIONS.md`](docs/ARCHITECTURE-AND-OPERATIONS.md). Module-by-module workflow catalog: [`docs/WORKFLOW-AND-DEVELOPER-CATALOG.md`](docs/WORKFLOW-AND-DEVELOPER-CATALOG.md). Step-by-step build / develop / deploy procedures — including the secure drop-file (drag-and-drop) release flow: [`docs/BUILD-DEVELOP-DEPLOY-SOP.md`](docs/BUILD-DEVELOP-DEPLOY-SOP.md).
 
 ```bash
 docker compose up -d --build
