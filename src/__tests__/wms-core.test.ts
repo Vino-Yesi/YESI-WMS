@@ -5,9 +5,20 @@ vi.mock('@/lib/db', () => ({
     preferences: {
       where: () => ({ equals: () => ({ first: async () => null }) }),
       add: async () => 1,
+      put: async () => 1,
       update: async () => 1,
     },
+    outboxEvents: {
+      where: () => ({ equals: () => ({ first: async () => null }) }),
+      add: async () => 1,
+      toArray: async () => [],
+    },
+    telemetryEvents: { add: async () => 1 },
+    stockBalances: { toArray: async () => [] },
+    auditLogs: { add: async () => 1 },
   },
+  availableQty: (b: { onHandQty: number; reservedQty: number; quarantineQty: number }) =>
+    Math.max(0, b.onHandQty - b.reservedQty - b.quarantineQty),
 }));
 
 import {
@@ -106,13 +117,65 @@ describe('WMS Transactional Outbox Validation & Retry Backoff', () => {
   it('rejects malformed outbox payloads and accepts valid lifecycle events', () => {
     expect(validateOutboxPayload('inbound_grn', { sku: '', qty: 5 }).valid).toBe(false);
     expect(validateOutboxPayload('inbound_grn', { sku: 'A17Black256', qty: -2 }).valid).toBe(false);
-    expect(validateOutboxPayload('inbound_grn', { sku: 'A17Black256', qty: 5 }).valid).toBe(true);
+    // Receiving without an exact bin + lot would create an ambiguous stock
+    // dimension, so it is rejected rather than defaulted silently.
+    expect(validateOutboxPayload('inbound_grn', { sku: 'A17Black256', qty: 5 }).valid).toBe(false);
+    expect(
+      validateOutboxPayload('inbound_grn', {
+        sku: 'A17Black256',
+        qty: 5,
+        bin: 'RECV-DOCK-01',
+        lotNumber: 'LOT-2026-11',
+      }).valid,
+    ).toBe(true);
 
     expect(validateOutboxPayload('qc_release', { sku: 'A17', qty: 2, disposition: 'invalid' }).valid).toBe(false);
     expect(validateOutboxPayload('qc_release', { sku: 'A17', qty: 2, disposition: 'release' }).valid).toBe(true);
 
     expect(validateOutboxPayload('dispatch_order', {}).valid).toBe(false);
     expect(validateOutboxPayload('dispatch_order', { orderId: 'ORD-1001' }).valid).toBe(true);
+  });
+
+  it('requires an exact stock dimension on every stock movement', () => {
+    expect(validateOutboxPayload('stock_movement', { sku: 'A17', qtyDelta: 2, transactionType: 'adjustment' }).valid).toBe(false);
+    expect(
+      validateOutboxPayload('stock_movement', {
+        sku: 'A17',
+        qtyDelta: 2,
+        transactionType: 'adjustment',
+        location: 'PHONE-A-01-01',
+        lotNumber: 'LOT-2026-11',
+      }).valid,
+    ).toBe(true);
+    expect(
+      validateOutboxPayload('stock_movement', {
+        sku: 'A17',
+        qtyDelta: 2,
+        transactionType: 'adjustment',
+        location: 'PHONE-A-01-01',
+        lotNumber: 'LOT-2026-11',
+        stockStatus: 'SELLABLE',
+      }).valid,
+    ).toBe(false);
+    expect(
+      validateOutboxPayload('stock_movement', {
+        sku: 'A17',
+        qtyDelta: 2,
+        transactionType: 'adjustment',
+        location: 'PHONE-A-01-01',
+        lotNumber: 'LOT-2026-11',
+        stockStatus: 'QUARANTINE',
+      }).valid,
+    ).toBe(true);
+    expect(validateOutboxPayload('stock_movement', { sku: 'A17', qtyDelta: 0, transactionType: 'adjustment', location: 'A', lotNumber: 'L' }).valid).toBe(false);
+  });
+
+  it('refuses to queue a pick confirmation without a scanned barcode', () => {
+    expect(validateOutboxPayload('confirm_pick', { taskNumber: 'PT-1' }).valid).toBe(false);
+    expect(validateOutboxPayload('confirm_pick', { taskNumber: 'PT-1', scannedCode: '' }).valid).toBe(false);
+    expect(validateOutboxPayload('confirm_pick', { taskNumber: 'PT-1', scannedCode: '3589120400001' }).valid).toBe(true);
+    expect(validateOutboxPayload('confirm_pick', { taskNumber: 'PT-1', scannedCode: '3589120400001', pickedQty: 0 }).valid).toBe(false);
+    expect(validateOutboxPayload('confirm_pick', { taskNumber: 'PT-1', scannedCode: '3589120400001', pickedQty: 2 }).valid).toBe(true);
   });
 
   it('computes exponential backoff with bounded ceiling', () => {

@@ -1,7 +1,16 @@
 import Dexie, { type Table } from 'dexie';
 import waveData from '@/data/ozon-wave.json';
-import { hashPasswordLocal, isHashedSecret } from './security';
+import { hashPasswordLocal, isHashedSecret, verifyPasswordLocal } from './security';
+import { runtimeConfig } from './config';
 import { enqueueCloudOperation } from './supabaseSync';
+
+/**
+ * Active tenancy defaults. Every locally-stored operational row is tagged with
+ * both values so a warehouse switch can never leak or mutate another site's
+ * stock, orders or movements.
+ */
+export const DEFAULT_TENANT_CODE: string = runtimeConfig.tenantCode;
+export const DEFAULT_WAREHOUSE_CODE: string = runtimeConfig.defaultWarehouseCode;
 
 // ─── Existing interfaces (enhanced) ─────────────────────────────────────
 export interface InventoryItem {
@@ -31,6 +40,18 @@ export interface InventoryItem {
   serializable?: boolean;
   // NEW: FEFO/FIFO control
   fefoPriority?: number; // higher = ship first
+  // v10: tenancy scope (rows are per tenant+warehouse, never global)
+  tenantCode?: string;
+  warehouseCode?: string;
+  // v10: derived rollup over `stockBalances` for this warehouse. `stock` stays
+  // the on-hand total; these expose the sellable / blocked split and the number
+  // of distinct bins and lots actually holding the SKU.
+  availableStock?: number;
+  reservedStock?: number;
+  quarantineStock?: number;
+  binCount?: number;
+  lotNumbers?: string[];
+  earliestExpiry?: string | null;
 }
 
 export interface Order {
@@ -55,10 +76,18 @@ export interface Order {
   suggestedBoxSize?: string;
   actualBoxSize?: string;
   packingMaterials?: string;
+  // v10: tenancy scope + real dispatch timestamp (drives "shipped today")
+  tenantCode?: string;
+  warehouseCode?: string;
+  shippedAt?: string | null;
+  channel?: string;
 }
 
 export interface ReturnRecord {
   id?: number;
+  // v10: tenancy scope — every operational row is bound to one site
+  tenantCode?: string;
+  warehouseCode?: string;
   orderId: string;
   sku: string;
   reason: string;
@@ -69,6 +98,9 @@ export interface ReturnRecord {
 
 export interface InboundRecord {
   id?: number;
+  // v10: tenancy scope — every operational row is bound to one site
+  tenantCode?: string;
+  warehouseCode?: string;
   sku: string;
   qty: number;
   bin: string;
@@ -107,6 +139,12 @@ export interface User {
   skillLevel?: number; // 1-5
   preferredTaskTypes?: string; // JSON
   currentZone?: string;
+  // v10: tenancy scope + first-run bootstrap / forced rotation
+  tenantCode?: string;
+  warehouseCode?: string;
+  mustChangePassword?: boolean;
+  passwordChangedAt?: string | null;
+  createdBy?: string | null;
 }
 
 export interface InventoryMovement {
@@ -121,10 +159,21 @@ export interface InventoryMovement {
   lotNumber?: string;
   note?: string;
   timestamp: string;
+  // v10: exact stock dimension the movement touched + tenancy scope
+  tenantCode?: string;
+  warehouseCode?: string;
+  stockStatus?: StockStatus;
+  serialNumber?: string;
+  expiryDate?: string | null;
+  idempotencyKey?: string;
+  cloudAccepted?: boolean;
 }
 
 export interface CycleCount {
   id?: number;
+  // v10: tenancy scope — every operational row is bound to one site
+  tenantCode?: string;
+  warehouseCode?: string;
   sku: string;
   location: string;
   expectedQty: number;
@@ -159,6 +208,9 @@ export interface ZoneCapacity {
 
 export interface WorkerTask {
   id?: number;
+  // v10: tenancy scope — every operational row is bound to one site
+  tenantCode?: string;
+  warehouseCode?: string;
   type: 'pick' | 'pack' | 'receive' | 'putaway' | 'cycle_count' | 'replenish' | 'ship' | 'label' | 'audit';
   orderId?: string;
   sku?: string;
@@ -193,8 +245,13 @@ export interface ReplenishmentTask {
 
 export interface QCHold {
   id?: number;
+  // v10: tenancy scope — every operational row is bound to one site
+  tenantCode?: string;
+  warehouseCode?: string;
   sku: string;
   lotNumber?: string;
+  /** Physical bin holding the blocked units (drives QUARANTINE dimension moves). */
+  location?: string;
   quantity: number;
   reason: string;
   status: 'hold' | 'released' | 'rejected';
@@ -295,6 +352,9 @@ export interface SimDbEntry {
 // ─── NEW: Purchase Order ────────────────────────────────────────────────
 export interface PurchaseOrder {
   id?: number;
+  // v10: tenancy scope — every operational row is bound to one site
+  tenantCode?: string;
+  warehouseCode?: string;
   poNumber: string;
   supplier: string;
   status: 'open' | 'partial' | 'received' | 'closed' | 'cancelled';
@@ -310,6 +370,9 @@ export interface PurchaseOrder {
 // ─── NEW: Shipping Label ───────────────────────────────────────────────
 export interface ShippingLabel {
   id?: number;
+  // v10: tenancy scope — every operational row is bound to one site
+  tenantCode?: string;
+  warehouseCode?: string;
   orderId: string;
   carrier: string;
   service: string;
@@ -428,6 +491,9 @@ export interface BoxSize {
 // ─── NEW v6: Serial Number ──────────────────────────────────────────────
 export interface SerialNumber {
   id?: number;
+  // v10: tenancy scope — every operational row is bound to one site
+  tenantCode?: string;
+  warehouseCode?: string;
   serialNumber: string;
   sku: string;
   product: string;
@@ -461,11 +527,15 @@ export interface SerialNumber {
 // ─── NEW v6: Putaway Task ───────────────────────────────────────────────
 export interface PutawayTask {
   id?: number;
+  // v10: tenancy scope — every operational row is bound to one site
+  tenantCode?: string;
+  warehouseCode?: string;
   taskId: string;
   sku: string;
   product: string;
   quantity: number;
   lotNumber?: string;
+  expiryDate?: string;
   // Source
   sourceLocation: string;
   sourceType: 'receiving' | 'returns' | 'transfer' | 'qc_release' | 'cross_dock';
@@ -492,7 +562,7 @@ export interface PutawayTask {
   actualTime?: number; // minutes
   distance?: number; // meters
   // Quality
-  qcStatus: 'pending' | 'passed' | 'failed';
+  qcStatus: 'pending' | 'passed' | 'failed' | 'released';
   putawayMethod: 'direct' | 'zone' | 'cross_dock' | 'consolidation';
   notes?: string;
   operator: string;
@@ -501,6 +571,9 @@ export interface PutawayTask {
 // ─── NEW v7: Dock Appointment ───────────────────────────────────────────
 export interface DockAppointment {
   id?: number;
+  // v10: tenancy scope — every operational row is bound to one site
+  tenantCode?: string;
+  warehouseCode?: string;
   appointmentId: string;
   supplier: string;
   poNumber?: string;
@@ -525,6 +598,12 @@ export interface DockAppointment {
 export interface InventoryReservation {
   id?: number;
   reservationId: string;
+  // v10: exact bin/lot the reservation is pinned to (multi-bin FEFO accuracy)
+  location?: string;
+  stockStatus?: StockStatus;
+  tenantCode?: string;
+  warehouseCode?: string;
+  expiryDate?: string | null;
   orderId: string;
   sku: string;
   quantity: number;
@@ -535,6 +614,9 @@ export interface InventoryReservation {
   reservedAt: string;
   expiresAt: string;
   operator: string;
+  /** Why a promise ended (manual release vs. expiry) — keeps audits truthful. */
+  note?: string;
+  releasedAt?: string;
 }
 
 // ─── NEW v8: Google Sheets Ozon Sync ────────────────────────────────────
@@ -597,6 +679,77 @@ export interface ConnectedDevice {
   registeredAt: string;
 }
 
+// ─── v10: Multi-Dimensional Stock, Leased Outbox & Telemetry ───────────
+export type StockStatus = 'AVAILABLE' | 'RESERVED' | 'QUARANTINE' | 'DAMAGED' | 'HOLD';
+
+/**
+ * One physical stock dimension row: tenant → warehouse → bin → SKU → lot →
+ * stock status (→ optional serial). Balances are NEVER collapsed by SKU: two
+ * bins holding the same SKU are two rows, and two warehouses are never mixed.
+ */
+export interface StockBalance {
+  id?: number;
+  tenantCode: string;
+  warehouseCode: string;
+  location: string;
+  sku: string;
+  lotNumber: string;
+  stockStatus: StockStatus;
+  serialNumber?: string;
+  onHandQty: number;
+  reservedQty: number;
+  quarantineQty: number;
+  expiryDate?: string | null;
+  cloudId?: string | null;
+  version: number;
+  updatedAt: string;
+}
+
+export type OutboxStatus = 'pending' | 'processing' | 'published' | 'failed' | 'dead_letter';
+
+/**
+ * One indexed outbox record per pending cloud command. Replaces the legacy
+ * single-JSON `preferences` blob so multiple tabs can lease, retry and inspect
+ * individual events, and so the DLQ is queryable.
+ */
+export interface OutboxEvent {
+  id?: number;
+  eventId: string;
+  idempotencyKey: string;
+  tenantCode: string;
+  warehouseCode: string;
+  command: string;
+  payload: Record<string, unknown>;
+  status: OutboxStatus;
+  retryCount: number;
+  nextRetryAt: number;
+  leaseOwner?: string | null;
+  leaseUntil?: number | null;
+  lastError?: string | null;
+  response?: Record<string, unknown> | null;
+  createdAt: string;
+  updatedAt: string;
+  publishedAt?: string | null;
+}
+
+export interface TelemetryEvent {
+  id?: number;
+  metric: string;
+  value: number;
+  unit: string;
+  tenantCode: string;
+  warehouseCode: string;
+  deviceId?: string;
+  labels?: Record<string, unknown>;
+  ts: number;
+  synced: 0 | 1;
+}
+
+/** Sellable units of one balance row (mirrors the SQL generated column). */
+export function availableQty(b: Pick<StockBalance, 'onHandQty' | 'reservedQty' | 'quarantineQty'>): number {
+  return Math.max(0, (b.onHandQty || 0) - (b.reservedQty || 0) - (b.quarantineQty || 0));
+}
+
 // ─── Database Class ────────────────────────────────────────────────────
 class VortexDB extends Dexie {
   inventory!: Table<InventoryItem>;
@@ -639,6 +792,10 @@ class VortexDB extends Dexie {
   connectedDevices!: Table<ConnectedDevice>;
   quickNotes!: Table<QuickNote>;
   gSheetEntries!: Table<GSheetEntry>;
+  // v10 tables
+  stockBalances!: Table<StockBalance>;
+  outboxEvents!: Table<OutboxEvent>;
+  telemetryEvents!: Table<TelemetryEvent>;
 
   constructor() {
     super('VortexWMS');
@@ -717,6 +874,31 @@ class VortexDB extends Dexie {
 
     this.version(9).stores({
       gSheetEntries: '++id, name, day, updatedAt',
+    });
+
+    // v10 — multi-dimensional stock, leased outbox, telemetry, and strict
+    // (tenant, warehouse) scoping indexes on every operational table so a
+    // warehouse switch can never read or write another warehouse's rows.
+    this.version(10).stores({
+      stockBalances:
+        '++id, &[tenantCode+warehouseCode+location+sku+lotNumber+stockStatus], [tenantCode+warehouseCode], [tenantCode+warehouseCode+sku], [tenantCode+warehouseCode+location], [tenantCode+warehouseCode+stockStatus], sku, location, expiryDate, updatedAt',
+      outboxEvents:
+        '++id, &eventId, &idempotencyKey, [tenantCode+warehouseCode+status], status, nextRetryAt, leaseUntil, command, createdAt',
+      telemetryEvents: '++id, metric, [tenantCode+warehouseCode], synced, ts',
+      inventory:
+        '++id, sku, location, category, velocity, barcode, rfidTag, lotNumber, batchNumber, expiryDate, tenantCode, warehouseCode, [tenantCode+warehouseCode], [tenantCode+warehouseCode+sku], [warehouseCode+sku], updatedAt',
+      orders:
+        '++id, orderId, status, priority, waveId, assignedTo, batchId, carrier, tenantCode, warehouseCode, shippedAt, updatedAt, [tenantCode+warehouseCode], [tenantCode+warehouseCode+status], [warehouseCode+status]',
+      inventoryMovements:
+        '++id, sku, type, timestamp, orderId, operator, tenantCode, warehouseCode, [tenantCode+warehouseCode], [warehouseCode+sku]',
+      inventoryReservations:
+        '++id, reservationId, orderId, sku, status, reservedAt, tenantCode, warehouseCode, [tenantCode+warehouseCode], [warehouseCode+sku]',
+      putawayTasks:
+        '++id, taskId, sku, status, assignedTo, destinationZone, sourceType, tenantCode, warehouseCode, [tenantCode+warehouseCode]',
+      qcHolds: '++id, sku, status, tenantCode, warehouseCode, [tenantCode+warehouseCode]',
+      inbound: '++id, sku, receivedAt, crossDockOrderId, qcStatus, poNumber, supplier, tenantCode, warehouseCode, [tenantCode+warehouseCode]',
+      returns: '++id, orderId, sku, tenantCode, warehouseCode, [tenantCode+warehouseCode]',
+      auditLogs: '++id, timestamp, action, operator',
     });
   }
 }
@@ -896,123 +1078,297 @@ export async function exportAllData() {
   };
 }
 
-// Seed data function (PBKDF2-SHA256 hashed credentials + opening stock)
-export async function seedDatabase() {
-  const now = new Date().toISOString();
-  const usersCount = await db.users.count();
-  if (usersCount === 0) {
-    const [adminHash, vinoHash, opHash, supHash] = await Promise.all([
-      hashPasswordLocal('admin'),
-      hashPasswordLocal('VINOVJ'),
-      hashPasswordLocal('operator'),
-      hashPasswordLocal('supervisor'),
+// ─── Seeding & First-Run Bootstrap ─────────────────────────────────────
+/**
+ * Demo seeding is a DEVELOPMENT affordance only.
+ *
+ * A production build (`import.meta.env.PROD`) never creates the legacy
+ * `admin`/`VINOVJ`/`operator`/`supervisor` accounts and never fabricates demo
+ * stock or marketplace orders, unless the operator explicitly opts in with
+ * `VITE_WMS_ENABLE_DEMO_SEED=true`. First-run access is granted through
+ * `bootstrapInitialAdmin()` (local edge mode) or the audited server-side
+ * `wms_bootstrap_first_admin` RPC (cloud mode).
+ */
+export const DEMO_SEED_ENABLED: boolean =
+  !import.meta.env.PROD || String(import.meta.env.VITE_WMS_ENABLE_DEMO_SEED ?? '').toLowerCase() === 'true';
+
+/** Reference/config data the floor UI needs even on an empty production install. */
+export async function seedReferenceData(): Promise<void> {
+  const zoneCount = await db.zoneCapacities.count();
+  if (zoneCount === 0) {
+    await db.zoneCapacities.bulkAdd([
+      { zone: "PHONE-A", maxCapacity: 400, currentUtilization: 0, category: "Phones", velocityTarget: "high", aisle: "A", rack: "01", shelf: "01", binType: "shelf" },
+      { zone: "WEAR-B", maxCapacity: 200, currentUtilization: 0, category: "Wearables", velocityTarget: "high", aisle: "B", rack: "01", shelf: "01", binType: "shelf" },
+      { zone: "AUDIO-C", maxCapacity: 150, currentUtilization: 0, category: "Audio", velocityTarget: "medium", aisle: "C", rack: "01", shelf: "01", binType: "shelf" },
+      { zone: "WAVE", maxCapacity: 80, currentUtilization: 0, category: "Staging", velocityTarget: "high", aisle: "PACK", rack: "00", shelf: "00", binType: "floor" },
     ]);
-    await db.users.bulkAdd([
-      { username: 'admin', password: adminHash, role: 'admin', displayName: 'Administrator', createdAt: now, skillLevel: 5 },
-      { username: 'VINOVJ', password: vinoHash, role: 'admin', displayName: 'Vino VJ', createdAt: now, skillLevel: 5 },
-      { username: 'operator', password: opHash, role: 'operator', displayName: 'Floor Operator', createdAt: now, skillLevel: 3 },
-      { username: 'supervisor', password: supHash, role: 'supervisor', displayName: 'Shift Supervisor', createdAt: now, skillLevel: 4 },
-    ]);
-  } else {
-    // Migrate any legacy plaintext passwords in IndexedDB to PBKDF2-SHA256
-    const existingUsers = await db.users.toArray();
-    for (const u of existingUsers) {
-      if (u.id != null && !isHashedSecret(u.password)) {
-        const hashed = await hashPasswordLocal(u.password);
-        await db.users.update(u.id, { password: hashed });
-      }
-    }
   }
 
-  const invCount = await db.inventory.count();
-  if (invCount === 0) {
-    const wave = waveData;
-    const locationFor = (product: string) => {
-      const p = product.toLowerCase();
-      if (p.includes("наушник") || p.includes("buds")) return "AUDIO-C-01";
-      if (p.includes("час") || p.includes("watch")) return "WEAR-B-01";
-      return "PHONE-A-01";
-    };
-    const categoryFor = (product: string) => {
-      const p = product.toLowerCase();
-      if (p.includes("наушник") || p.includes("buds")) return "Audio";
-      if (p.includes("час") || p.includes("watch")) return "Wearables";
-      return "Phones";
-    };
-
-    await db.inventory.bulkAdd(
-      wave.skus.map((s) => ({
-        sku: s.article || s.sku,
-        barcode: s.sku,
-        product: s.product,
-        stock: Math.max(8, Math.round(s.qty) * 3),
-        location: locationFor(s.product),
-        category: categoryFor(s.product),
-        velocity: s.qty >= 7 ? "high" : s.qty >= 3 ? "medium" : "low",
-        costPerUnit: s.price,
-        serializable: true,
-        reorderPoint: 4,
-        reorderQty: 10,
-        updatedAt: now,
-      })),
-    );
-
-    await db.orders.bulkAdd(
-      wave.postings.map((p) => ({
-        orderId: p.postingId,
-        status: "Pending" as const,
-        requiredSkus: p.article || p.sku,
-        priority: p.amount >= 500 ? "high" : "normal",
-        createdAt: p.acceptedAt || now,
-        updatedAt: now,
-        carrier: "GBS Express",
-        service: "Ozon Global",
-        trackingNumber: p.postingId,
-        shippingCost: 0,
-        weightTotal: 0.4,
-      })),
-    );
-
-    await db.postingRecords.bulkAdd(
-      wave.postings.map((p) => ({
-        postingId: p.postingId,
-        trackingId: p.postingId,
-        orderId: p.orderId,
-        status: "received" as const,
-        carrier: "Ozon / GBS Express",
-        city: "Sharjah",
-        note: p.product,
-        operator: "System",
-        createdAt: p.acceptedAt || now,
-        folder: "wave-31-may",
-      })),
-    );
-
-    await db.zoneCapacities.bulkAdd([
-      { zone: "PHONE-A", maxCapacity: 400, currentUtilization: 120, category: "Phones", velocityTarget: "high", aisle: "A", rack: "01", shelf: "01", binType: "shelf" },
-      { zone: "WEAR-B", maxCapacity: 200, currentUtilization: 60, category: "Wearables", velocityTarget: "high", aisle: "B", rack: "01", shelf: "01", binType: "shelf" },
-      { zone: "AUDIO-C", maxCapacity: 150, currentUtilization: 40, category: "Audio", velocityTarget: "medium", aisle: "C", rack: "01", shelf: "01", binType: "shelf" },
-      { zone: "WAVE", maxCapacity: 80, currentUtilization: 60, category: "Staging", velocityTarget: "high", aisle: "PACK", rack: "00", shelf: "00", binType: "floor" },
-    ]);
-
+  const boxCount = await db.boxSizes.count();
+  if (boxCount === 0) {
     await db.boxSizes.bulkAdd([
       { name: "Phone S", length: 18, width: 10, height: 4, maxWeight: 0.5, cost: 0.35, material: "corrugated", active: true },
       { name: "Phone M", length: 20, width: 12, height: 5, maxWeight: 0.7, cost: 0.45, material: "corrugated", active: true },
       { name: "Watch", length: 14, width: 12, height: 8, maxWeight: 0.4, cost: 0.4, material: "corrugated", active: true },
       { name: "Audio", length: 12, width: 10, height: 6, maxWeight: 0.3, cost: 0.3, material: "corrugated", active: true },
     ]);
+  }
 
+  const rateCount = await db.carrierRates.count();
+  if (rateCount === 0) {
     await db.carrierRates.bulkAdd([
       { carrier: "GBS Express", service: "Ozon Global", weightFrom: 0, weightTo: 0.5, zone: "RU", rate: 8.5, currency: "USD", estimatedDays: 12, active: true },
       { carrier: "GBS Express", service: "Ozon Global", weightFrom: 0.5, weightTo: 2, zone: "RU", rate: 12, currency: "USD", estimatedDays: 12, active: true },
     ]);
-
-    await db.auditLogs.add({
-      action: "SEED",
-      details: `Loaded Ozon wave: ${wave.postings.length} postings, ${wave.skus.length} SKUs`,
-      operator: "System",
-      timestamp: now,
-    });
   }
 }
 
+/** True when the local edge database has no operator account yet. */
+export async function requiresBootstrap(): Promise<boolean> {
+  try {
+    return (await db.users.count()) === 0;
+  } catch {
+    return false;
+  }
+}
+
+export interface BootstrapInput {
+  username: string;
+  password: string;
+  displayName?: string;
+  role?: User['role'];
+  tenantCode?: string;
+  warehouseCode?: string;
+}
+
+export type BootstrapResult =
+  | { ok: true; username: string; role: User['role'] }
+  | { ok: false; code: string; error: string };
+
+/** Client-side mirror of the server password policy (migration 008). */
+export function validatePasswordStrength(password: string, username: string): { ok: true } | { ok: false; code: string; error: string } {
+  const pwd = password ?? '';
+  if (pwd.length < 10) return { ok: false, code: 'PASSWORD_TOO_SHORT', error: 'Password must be at least 10 characters' };
+  if (pwd.length > 128) return { ok: false, code: 'PASSWORD_TOO_LONG', error: 'Password must be at most 128 characters' };
+  let classes = 0;
+  if (/[a-z]/.test(pwd)) classes++;
+  if (/[A-Z]/.test(pwd)) classes++;
+  if (/[0-9]/.test(pwd)) classes++;
+  if (/[^A-Za-z0-9]/.test(pwd)) classes++;
+  if (classes < 3) {
+    return { ok: false, code: 'PASSWORD_TOO_SIMPLE', error: 'Combine at least 3 of: lowercase, uppercase, digit, symbol' };
+  }
+  if (username && pwd.toLowerCase() === username.trim().toLowerCase()) {
+    return { ok: false, code: 'PASSWORD_EQUALS_USERNAME', error: 'Password must not equal the username' };
+  }
+  const common = ['password', 'password123', 'qwertyuiop', '1234567890', 'adminadmin', 'changeme123'];
+  if (common.includes(pwd.toLowerCase())) return { ok: false, code: 'PASSWORD_COMMON', error: 'Password is too common' };
+  return { ok: true };
+}
+
+/**
+ * One-time first administrator bootstrap for Offline-Edge mode.
+ * Refuses to run once any operator account exists, and never accepts a
+ * password equal to the username or shorter than the policy minimum.
+ */
+export async function bootstrapInitialAdmin(input: BootstrapInput): Promise<BootstrapResult> {
+  const username = (input.username ?? '').trim();
+  if (!/^[A-Za-z0-9._-]{3,32}$/.test(username)) {
+    return { ok: false, code: 'INVALID_USERNAME', error: 'Username must be 3-32 characters (letters, digits, dot, dash, underscore)' };
+  }
+  const strength = validatePasswordStrength(input.password ?? '', username);
+  if (!strength.ok) return strength;
+
+  try {
+    if ((await db.users.count()) > 0) {
+      return {
+        ok: false,
+        code: 'BOOTSTRAP_ALREADY_COMPLETED',
+        error: 'Bootstrap is closed: this installation already has operator accounts.',
+      };
+    }
+    const now = new Date().toISOString();
+    const role = input.role ?? 'admin';
+    await db.users.add({
+      username,
+      password: await hashPasswordLocal(input.password),
+      role,
+      displayName: (input.displayName ?? '').trim() || username,
+      createdAt: now,
+      skillLevel: role === 'admin' ? 5 : 3,
+      tenantCode: input.tenantCode ?? DEFAULT_TENANT_CODE,
+      warehouseCode: input.warehouseCode ?? DEFAULT_WAREHOUSE_CODE,
+      mustChangePassword: false,
+    } as User);
+    await db.auditLogs.add({
+      action: 'ADMIN_BOOTSTRAPPED',
+      details: `First-run administrator bootstrap completed for ${username}`,
+      operator: username,
+      timestamp: now,
+    });
+    await db.preferences.put({ key: 'wms_bootstrap_completed_at', value: now, createdAt: now } as Preference);
+    return { ok: true, username, role };
+  } catch (err) {
+    return { ok: false, code: 'BOOTSTRAP_FAILED', error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/** Rotate a local operator credential (also clears a forced-rotation flag). */
+export async function rotateLocalPassword(
+  username: string,
+  currentPassword: string,
+  newPassword: string,
+): Promise<{ ok: true } | { ok: false; code: string; error: string }> {
+  const user = await db.users.where('username').equalsIgnoreCase(username.trim()).first();
+  if (!user || user.id == null) return { ok: false, code: 'USER_NOT_FOUND', error: 'Operator not found' };
+  if (!(await verifyPasswordLocal(currentPassword, user.password))) {
+    return { ok: false, code: 'CURRENT_PASSWORD_INVALID', error: 'Current password is incorrect' };
+  }
+  const strength = validatePasswordStrength(newPassword, user.username);
+  if (!strength.ok) return strength;
+  await db.users.update(user.id, {
+    password: await hashPasswordLocal(newPassword),
+    mustChangePassword: false,
+  });
+  await logAction('PASSWORD_ROTATED', `Local credential rotated for ${user.username}`, user.username);
+  return { ok: true };
+}
+
+/**
+ * Demo dataset (development only): legacy Ozon wave SKUs, postings and orders.
+ * Guarded by `DEMO_SEED_ENABLED`; production builds call `seedReferenceData()`.
+ */
+export async function seedDemoWaveData(): Promise<void> {
+  const now = new Date().toISOString();
+  const invCount = await db.inventory.count();
+  if (invCount > 0) return;
+
+  const wave = waveData;
+  const locationFor = (product: string) => {
+    const p = product.toLowerCase();
+    if (p.includes("наушник") || p.includes("buds")) return "AUDIO-C-01";
+    if (p.includes("час") || p.includes("watch")) return "WEAR-B-01";
+    return "PHONE-A-01";
+  };
+  const categoryFor = (product: string) => {
+    const p = product.toLowerCase();
+    if (p.includes("наушник") || p.includes("buds")) return "Audio";
+    if (p.includes("час") || p.includes("watch")) return "Wearables";
+    return "Phones";
+  };
+
+  await db.inventory.bulkAdd(
+    wave.skus.map((s) => ({
+      sku: s.article || s.sku,
+      barcode: s.sku,
+      product: s.product,
+      stock: Math.max(8, Math.round(s.qty) * 3),
+      location: locationFor(s.product),
+      category: categoryFor(s.product),
+      velocity: s.qty >= 7 ? "high" : s.qty >= 3 ? "medium" : "low",
+      costPerUnit: s.price,
+      serializable: true,
+      reorderPoint: 4,
+      reorderQty: 10,
+      tenantCode: DEFAULT_TENANT_CODE,
+      warehouseCode: DEFAULT_WAREHOUSE_CODE,
+      updatedAt: now,
+    })),
+  );
+
+  await db.orders.bulkAdd(
+    wave.postings.map((p) => ({
+      orderId: p.postingId,
+      status: "Pending" as const,
+      requiredSkus: p.article || p.sku,
+      priority: p.amount >= 500 ? "high" : "normal",
+      createdAt: p.acceptedAt || now,
+      updatedAt: now,
+      carrier: "GBS Express",
+      service: "Ozon Global",
+      trackingNumber: p.postingId,
+      shippingCost: 0,
+      weightTotal: 0.4,
+      tenantCode: DEFAULT_TENANT_CODE,
+      warehouseCode: DEFAULT_WAREHOUSE_CODE,
+    })),
+  );
+
+  await db.postingRecords.bulkAdd(
+    wave.postings.map((p) => ({
+      postingId: p.postingId,
+      trackingId: p.postingId,
+      orderId: p.orderId,
+      status: "received" as const,
+      carrier: "Ozon / GBS Express",
+      city: "Sharjah",
+      note: p.product,
+      operator: "System",
+      createdAt: p.acceptedAt || now,
+      folder: "wave-31-may",
+    })),
+  );
+
+  await db.auditLogs.add({
+    action: "SEED",
+    details: `Loaded demo Ozon wave: ${wave.postings.length} postings, ${wave.skus.length} SKUs (development mode)`,
+    operator: "System",
+    timestamp: now,
+  });
+}
+
+/**
+ * Boot-time seeding entry point.
+ *
+ * - Always: migrate legacy plaintext local passwords to PBKDF2-SHA256 and load
+ *   operational reference data.
+ * - Development / explicit opt-in only: demo accounts + demo wave data.
+ */
+export async function seedDatabase(): Promise<{ demoSeeded: boolean; users: number }> {
+  const now = new Date().toISOString();
+
+  // Legacy plaintext -> PBKDF2-SHA256 migration (never seeds credentials itself)
+  try {
+    const existingUsers = await db.users.toArray();
+    for (const u of existingUsers) {
+      if (u.id != null && !isHashedSecret(u.password)) {
+        await db.users.update(u.id, { password: await hashPasswordLocal(u.password) });
+      }
+    }
+  } catch {
+    // IndexedDB may be unavailable inside a restricted iframe
+  }
+
+  await seedReferenceData();
+
+  if (!DEMO_SEED_ENABLED) {
+    await db.auditLogs
+      .add({
+        action: "SEED_SKIPPED",
+        details: "Production build: demo operator accounts and demo stock were not seeded",
+        operator: "System",
+        timestamp: now,
+      })
+      .catch(() => {});
+    return { demoSeeded: false, users: await db.users.count().catch(() => 0) };
+  }
+
+  const usersCount = await db.users.count();
+  if (usersCount === 0) {
+    const [adminHash, vinoHash, opHash, supHash] = await Promise.all([
+      hashPasswordLocal('admin-demo-2026'),
+      hashPasswordLocal('vinovj-demo-2026'),
+      hashPasswordLocal('operator-demo-2026'),
+      hashPasswordLocal('supervisor-demo-2026'),
+    ]);
+    await db.users.bulkAdd([
+      { username: 'admin', password: adminHash, role: 'admin', displayName: 'Administrator', createdAt: now, skillLevel: 5, mustChangePassword: true },
+      { username: 'VINOVJ', password: vinoHash, role: 'admin', displayName: 'Vino VJ', createdAt: now, skillLevel: 5, mustChangePassword: true },
+      { username: 'operator', password: opHash, role: 'operator', displayName: 'Floor Operator', createdAt: now, skillLevel: 3, mustChangePassword: true },
+      { username: 'supervisor', password: supHash, role: 'supervisor', displayName: 'Shift Supervisor', createdAt: now, skillLevel: 4, mustChangePassword: true },
+    ] as User[]);
+  }
+
+  await seedDemoWaveData();
+  return { demoSeeded: true, users: await db.users.count() };
+}

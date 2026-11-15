@@ -1,8 +1,10 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { useAuth } from '@/lib/auth';
-import { WMS_DEFAULT_WAREHOUSE } from '@/lib/supabase';
-import { Eye, EyeOff, Hexagon, Sparkles, Shield, Zap, Package } from 'lucide-react';
+import { useAuth, type BootstrapStatus } from '@/lib/auth';
+import { validatePasswordStrength } from '@/lib/db';
+import { WMS_DEFAULT_WAREHOUSE, WMS_TENANT_CODE } from '@/lib/supabase';
+import { listCloudWarehouses } from '@/lib/supabaseSync';
+import { Eye, EyeOff, Hexagon, Sparkles, Shield, Zap, Package, KeyRound, UserPlus } from 'lucide-react';
 import { Navigate, useNavigate } from 'react-router-dom';
 
 function Starfield() {
@@ -88,39 +90,174 @@ const FEATURES = [
   { icon: Sparkles, label: 'Adaptation' },
 ];
 
+type LoginMode = 'signin' | 'bootstrap' | 'rotate';
+
 export default function Login() {
-  const { loginDetailed, user } = useAuth();
+  const {
+    loginDetailed,
+    user,
+    mustChangePassword,
+    getBootstrapStatus,
+    bootstrapFirstAdmin,
+    rotatePassword,
+  } = useAuth();
   const navigate = useNavigate();
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [warehouseCode, setWarehouseCode] = useState(WMS_DEFAULT_WAREHOUSE);
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
   const [loading, setLoading] = useState(false);
   const [shake, setShake] = useState(false);
   const [focusField, setFocusField] = useState<'user' | 'pass' | null>(null);
+
+  // First-run / forced-rotation state
+  const [mode, setMode] = useState<LoginMode>('signin');
+  const [bootstrapStatus, setBootstrapStatus] = useState<BootstrapStatus | null>(null);
+  const [warehouses, setWarehouses] = useState<Array<{ code: string; name: string }>>([]);
+  const [displayName, setDisplayName] = useState('');
+  const [email, setEmail] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [rotateUser, setRotateUser] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const status = await getBootstrapStatus();
+      if (cancelled) return;
+      setBootstrapStatus(status);
+      if (status.bootstrap_required) setMode('bootstrap');
+
+      const cloud = await listCloudWarehouses();
+      if (cancelled) return;
+      if (cloud.length > 0) {
+        setWarehouses(cloud.filter((w) => w.status === 'active').map((w) => ({ code: w.code, name: w.name })));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [getBootstrapStatus]);
+
+  useEffect(() => {
+    if (mustChangePassword && mode === 'signin') {
+      setMode('rotate');
+      setRotateUser(username.trim());
+      setCurrentPassword(password);
+    }
+  }, [mustChangePassword, mode, username, password]);
+
+  const fail = useCallback((message: string) => {
+    setError(message);
+    setShake(true);
+    setTimeout(() => setShake(false), 500);
+  }, []);
 
   if (user) {
     return <Navigate to="/" replace />;
   }
 
+  const passwordIssue =
+    password.length > 0 ? (() => {
+      const check = validatePasswordStrength(password, username.trim());
+      return check.ok ? '' : check.error;
+    })() : '';
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
+    setNotice('');
     setLoading(true);
     try {
       const outcome = await loginDetailed(username.trim(), password, warehouseCode);
       if (!outcome.ok) {
-        setError(outcome.message || 'Invalid credentials. Check username and password.');
-        setShake(true);
-        setTimeout(() => setShake(false), 500);
+        if (outcome.code === 'PASSWORD_CHANGE_REQUIRED') {
+          setRotateUser(outcome.pendingUser?.username || username.trim());
+          setCurrentPassword(password);
+          setPassword('');
+          setConfirmPassword('');
+          setMode('rotate');
+          setNotice(outcome.message || 'This credential must be rotated before use.');
+          return;
+        }
+        fail(outcome.message || 'Invalid credentials. Check username and password.');
       } else {
         navigate('/', { replace: true });
       }
     } catch {
-      setError('Login failed. Please try again.');
-      setShake(true);
-      setTimeout(() => setShake(false), 500);
+      fail('Login failed. Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleBootstrap = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError('');
+    setNotice('');
+    if (password !== confirmPassword) {
+      fail('Passwords do not match.');
+      return;
+    }
+    const strength = validatePasswordStrength(password, username.trim());
+    if (!strength.ok) {
+      fail(strength.error);
+      return;
+    }
+    setLoading(true);
+    try {
+      const outcome = await bootstrapFirstAdmin({
+        username: username.trim(),
+        password,
+        displayName: displayName.trim() || undefined,
+        email: email.trim() || undefined,
+        warehouseCode,
+      });
+      if (outcome.ok) {
+        navigate('/', { replace: true });
+      } else {
+        fail(outcome.message || 'Bootstrap was refused.');
+      }
+    } catch (err) {
+      fail(err instanceof Error ? err.message : 'Bootstrap failed.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleRotate = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError('');
+    setNotice('');
+    if (password !== confirmPassword) {
+      fail('New passwords do not match.');
+      return;
+    }
+    const strength = validatePasswordStrength(password, rotateUser.trim() || username.trim());
+    if (!strength.ok) {
+      fail(strength.error);
+      return;
+    }
+    setLoading(true);
+    try {
+      const result = await rotatePassword({
+        username: rotateUser.trim() || username.trim(),
+        currentPassword: currentPassword || password,
+        newPassword: password,
+      });
+      if (result.ok) {
+        setMode('signin');
+        setPassword('');
+        setConfirmPassword('');
+        setCurrentPassword('');
+        setNotice(`${result.message}. Sign in with the new credential.`);
+      } else {
+        fail(result.message);
+      }
+    } catch (err) {
+      fail(err instanceof Error ? err.message : 'Rotation failed.');
     } finally {
       setLoading(false);
     }
@@ -233,17 +370,34 @@ export default function Login() {
                     <Hexagon className="w-7 h-7 text-white drop-shadow" strokeWidth={2.25} />
                   </div>
                 </motion.div>
-                <h1 className="text-xl font-semibold tracking-tight">Yesi-WMS Lite</h1>
-                <p className="text-xs text-white/40 mt-1 flex items-center gap-1.5">
-                  <Sparkles className="w-3 h-3 text-sky-400/80" />
-                  Sign in to your warehouse floor
+                <h1 className="text-xl font-semibold tracking-tight">
+                  {mode === 'bootstrap' ? 'First-Run Setup' : mode === 'rotate' ? 'Credential Rotation' : 'Yesi-WMS Lite'}
+                </h1>
+                <p className="text-xs text-white/40 mt-1 flex items-center gap-1.5 text-center">
+                  {mode === 'bootstrap' ? (
+                    <UserPlus className="w-3 h-3 text-emerald-400/80 shrink-0" />
+                  ) : mode === 'rotate' ? (
+                    <KeyRound className="w-3 h-3 text-amber-400/80 shrink-0" />
+                  ) : (
+                    <Sparkles className="w-3 h-3 text-sky-400/80 shrink-0" />
+                  )}
+                  <span>
+                    {mode === 'bootstrap'
+                      ? `Create the first administrator for ${WMS_TENANT_CODE}`
+                      : mode === 'rotate'
+                        ? 'This account must set a new password before floor access'
+                        : 'Sign in to your warehouse floor'}
+                  </span>
                 </p>
               </div>
 
-              <form onSubmit={handleSubmit} className="space-y-4">
+              <form
+                onSubmit={mode === 'bootstrap' ? handleBootstrap : mode === 'rotate' ? handleRotate : handleSubmit}
+                className="space-y-4"
+              >
                 <div>
                   <label className="text-[10px] uppercase tracking-[0.18em] text-white/35 font-medium ml-0.5">
-                    Username
+                    {mode === 'rotate' ? 'Operator' : mode === 'bootstrap' ? 'New administrator username' : 'Username'}
                   </label>
                   <div
                     className={`mt-1.5 relative rounded-xl transition-all duration-300 ${
@@ -253,19 +407,72 @@ export default function Login() {
                     <input
                       type="text"
                       autoComplete="username"
-                      value={username}
-                      onChange={(e) => setUsername(e.target.value)}
+                      value={mode === 'rotate' ? rotateUser : username}
+                      onChange={(e) => (mode === 'rotate' ? setRotateUser(e.target.value) : setUsername(e.target.value))}
                       onFocus={() => setFocusField('user')}
                       onBlur={() => setFocusField(null)}
-                      placeholder="admin"
-                      className="w-full rounded-xl bg-white/[0.04] border border-white/[0.08] px-4 py-3 text-sm text-white placeholder:text-white/25 focus:outline-none focus:border-sky-400/40 transition-colors"
+                      placeholder={mode === 'bootstrap' ? 'floor.admin' : 'username'}
+                      pattern={mode === 'bootstrap' ? '[A-Za-z0-9._-]{3,32}' : undefined}
+                      className="w-full rounded-xl bg-white/[0.04] border border-white/[0.08] px-4 py-3 text-sm text-white placeholder:text-white/25 focus:outline-none focus:border-sky-400/40 transition-colors font-mono"
                     />
                   </div>
+                  {mode === 'bootstrap' && (
+                    <p className="text-[10px] text-white/30 mt-1 ml-0.5">
+                      3-32 characters: letters, digits, dot, dash, underscore.
+                    </p>
+                  )}
                 </div>
+
+                {mode === 'bootstrap' && (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                      <label className="text-[10px] uppercase tracking-[0.18em] text-white/35 font-medium ml-0.5">
+                        Display name
+                      </label>
+                      <input
+                        type="text"
+                        autoComplete="name"
+                        value={displayName}
+                        onChange={(e) => setDisplayName(e.target.value)}
+                        placeholder="Floor Administrator"
+                        className="mt-1.5 w-full rounded-xl bg-white/[0.04] border border-white/[0.08] px-4 py-2.5 text-sm text-white placeholder:text-white/25 focus:outline-none focus:border-sky-400/40 transition-colors"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-[10px] uppercase tracking-[0.18em] text-white/35 font-medium ml-0.5">
+                        Email (optional)
+                      </label>
+                      <input
+                        type="email"
+                        autoComplete="email"
+                        value={email}
+                        onChange={(e) => setEmail(e.target.value)}
+                        placeholder="ops@yesi.example"
+                        className="mt-1.5 w-full rounded-xl bg-white/[0.04] border border-white/[0.08] px-4 py-2.5 text-sm text-white placeholder:text-white/25 focus:outline-none focus:border-sky-400/40 transition-colors"
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {mode === 'rotate' && (
+                  <div>
+                    <label className="text-[10px] uppercase tracking-[0.18em] text-white/35 font-medium ml-0.5">
+                      Current password
+                    </label>
+                    <input
+                      type="password"
+                      autoComplete="current-password"
+                      value={currentPassword}
+                      onChange={(e) => setCurrentPassword(e.target.value)}
+                      placeholder="••••••••"
+                      className="mt-1.5 w-full rounded-xl bg-white/[0.04] border border-white/[0.08] px-4 py-3 text-sm text-white placeholder:text-white/25 focus:outline-none focus:border-sky-400/40 transition-colors"
+                    />
+                  </div>
+                )}
 
                 <div>
                   <label className="text-[10px] uppercase tracking-[0.18em] text-white/35 font-medium ml-0.5">
-                    Password
+                    {mode === 'signin' ? 'Password' : 'New password'}
                   </label>
                   <div
                     className={`mt-1.5 relative rounded-xl transition-all duration-300 ${
@@ -291,7 +498,35 @@ export default function Login() {
                       {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                     </button>
                   </div>
+                  {mode !== 'signin' && (
+                    <p className={`text-[10px] mt-1 ml-0.5 ${passwordIssue ? 'text-amber-400/80' : 'text-white/30'}`}>
+                      {passwordIssue || 'Minimum 10 characters with at least 3 of: lowercase, uppercase, digit, symbol.'}
+                    </p>
+                  )}
                 </div>
+
+                {mode !== 'signin' && (
+                  <div>
+                    <label className="text-[10px] uppercase tracking-[0.18em] text-white/35 font-medium ml-0.5">
+                      Confirm new password
+                    </label>
+                    <input
+                      type={showPassword ? 'text' : 'password'}
+                      autoComplete="new-password"
+                      value={confirmPassword}
+                      onChange={(e) => setConfirmPassword(e.target.value)}
+                      placeholder="••••••••"
+                      className={`mt-1.5 w-full rounded-xl bg-white/[0.04] border px-4 py-3 text-sm text-white placeholder:text-white/25 focus:outline-none transition-colors ${
+                        confirmPassword.length > 0 && confirmPassword !== password
+                          ? 'border-rose-500/40 focus:border-rose-400/50'
+                          : 'border-white/[0.08] focus:border-sky-400/40'
+                      }`}
+                    />
+                    {confirmPassword.length > 0 && confirmPassword !== password && (
+                      <p className="text-[10px] text-rose-400/80 mt-1 ml-0.5">Passwords do not match.</p>
+                    )}
+                  </div>
+                )}
 
                 <div>
                   <label className="text-[10px] uppercase tracking-[0.18em] text-white/35 font-medium ml-0.5">
@@ -302,12 +537,35 @@ export default function Login() {
                     onChange={(e) => setWarehouseCode(e.target.value)}
                     className="mt-1.5 w-full rounded-xl bg-white/[0.04] border border-white/[0.08] px-4 py-2.5 text-xs font-mono text-white focus:outline-none focus:border-sky-400/40 transition-colors"
                   >
-                    <option value="DXB-FC1" className="bg-[#0c0c14]">DXB-FC1 — Dubai Fulfillment Center 1</option>
-                    <option value="MSK-HUB2" className="bg-[#0c0c14]">MSK-HUB2 — Moscow Cross-Dock Hub 2</option>
+                    {/* Populated from the cloud warehouse registry; falls back to
+                        the build-time default when running fully offline. */}
+                    {(warehouses.length > 0
+                      ? warehouses
+                      : [{ code: WMS_DEFAULT_WAREHOUSE, name: 'Default facility' }]
+                    ).map((w) => (
+                      <option key={w.code} value={w.code} className="bg-[#0c0c14]">
+                        {w.code} — {w.name}
+                      </option>
+                    ))}
+                    {warehouses.length > 0 && !warehouses.some((w) => w.code === warehouseCode) && (
+                      <option value={warehouseCode} className="bg-[#0c0c14]">
+                        {warehouseCode} — (configured default)
+                      </option>
+                    )}
                   </select>
                 </div>
 
                 <AnimatePresence>
+                  {notice && (
+                    <motion.p
+                      initial={{ opacity: 0, height: 0 }}
+                      animate={{ opacity: 1, height: 'auto' }}
+                      exit={{ opacity: 0, height: 0 }}
+                      className="text-xs text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-2"
+                    >
+                      {notice}
+                    </motion.p>
+                  )}
                   {error && (
                     <motion.p
                       initial={{ opacity: 0, height: 0 }}
@@ -320,9 +578,42 @@ export default function Login() {
                   )}
                 </AnimatePresence>
 
+                {mode === 'bootstrap' && bootstrapStatus && (
+                  <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/[0.07] px-3 py-2.5 text-[11px] text-emerald-200/80 space-y-0.5">
+                    <p className="font-semibold text-emerald-200">No administrator exists yet</p>
+                    <p>
+                      Tenant <span className="font-mono">{bootstrapStatus.tenant_code || WMS_TENANT_CODE}</span> ·{' '}
+                      {bootstrapStatus.active_users} active account(s)
+                    </p>
+                    <p className="text-emerald-200/60">
+                      Bootstrap runs once and then closes permanently. The account is written to the audited server
+                      registry, not to the browser bundle.
+                    </p>
+                  </div>
+                )}
+
+                {mode === 'rotate' && (
+                  <div className="rounded-lg border border-amber-500/20 bg-amber-500/[0.07] px-3 py-2.5 text-[11px] text-amber-200/80 space-y-0.5">
+                    <p className="font-semibold text-amber-200">Mandatory credential rotation</p>
+                    <p>
+                      {bootstrapStatus && bootstrapStatus.users_requiring_rotation > 0
+                        ? `${bootstrapStatus.users_requiring_rotation} account(s) in this tenant still carry a legacy or first-run credential.`
+                        : 'This account carries a legacy or first-run credential.'}
+                    </p>
+                    <p className="text-amber-200/60">
+                      Rotating clears the flag on the server and revokes other active sessions for this operator.
+                    </p>
+                  </div>
+                )}
+
                 <motion.button
                   type="submit"
-                  disabled={loading || !username || !password}
+                  disabled={
+                    loading ||
+                    !password ||
+                    (mode === 'rotate' ? !rotateUser : !username) ||
+                    (mode !== 'signin' && (password !== confirmPassword || Boolean(passwordIssue)))
+                  }
                   whileHover={{ scale: loading ? 1 : 1.015 }}
                   whileTap={{ scale: 0.98 }}
                   className="group relative w-full py-3.5 rounded-xl font-semibold text-sm text-white overflow-hidden disabled:opacity-40 disabled:cursor-not-allowed mt-1"
@@ -343,18 +634,42 @@ export default function Login() {
                     {loading ? (
                       <>
                         <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                        Authenticating…
+                        {mode === 'bootstrap' ? 'Creating administrator…' : mode === 'rotate' ? 'Rotating credential…' : 'Authenticating…'}
+                      </>
+                    ) : mode === 'bootstrap' ? (
+                      <>
+                        <UserPlus className="w-4 h-4" /> Create first administrator
+                      </>
+                    ) : mode === 'rotate' ? (
+                      <>
+                        <KeyRound className="w-4 h-4" /> Set new password
                       </>
                     ) : (
                       'Sign in'
                     )}
                   </span>
                 </motion.button>
+
+                {mode === 'signin' && bootstrapStatus && bootstrapStatus.users_requiring_rotation > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMode('rotate');
+                      setRotateUser(username.trim());
+                      setError('');
+                      setNotice('Enter the operator whose credential must be rotated.');
+                    }}
+                    className="w-full text-[11px] text-amber-300/80 hover:text-amber-200 transition-colors flex items-center justify-center gap-1.5 mt-2"
+                  >
+                    <KeyRound className="w-3 h-3" />
+                    Rotate a flagged credential ({bootstrapStatus.users_requiring_rotation} pending)
+                  </button>
+                )}
               </form>
 
               <div className="mt-6 pt-5 border-t border-white/[0.06]">
                 <p className="text-[10px] text-center text-white/25 font-mono tracking-wide">
-                  <span className="text-sky-400/60">YESI-FZCO</span>
+                  <span className="text-sky-400/60">{WMS_TENANT_CODE}</span>
                   <span className="mx-2 text-white/15">·</span>
                   Warehouse Fulfillment Tool
                 </p>

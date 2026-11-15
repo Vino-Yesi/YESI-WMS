@@ -1,6 +1,8 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { db, logAction, logInventoryMovement } from '@/lib/db';
+import { db, logAction, type StockBalance } from '@/lib/db';
+import { getStockScope, upsertDimension, refreshInventoryRollup, type StockScope } from '@/lib/stockBalances';
+import { getActiveWarehouseCode, enqueueCloudOperation } from '@/lib/supabaseSync';
 import { useAuth } from '@/lib/auth';
 import { AlertTriangle, Search, Package, MapPin, Barcode, Hash, DollarSign, Timer, Calendar, TrendingUp, Plus, X, History, Tag, Box, Ruler, ScanLine, Truck, ShieldAlert, Sparkles } from 'lucide-react';
 import BarcodeReader from '@/components/BarcodeReader';
@@ -54,17 +56,38 @@ export default function InventoryHub() {
   const [showScanner, setShowScanner] = useState(false);
   const [scanMessage, setScanMessage] = useState<string | null>(null);
   const [lotInboundRecords, setLotInboundRecords] = useState<InboundRecord[]>([]);
+  // v3: dimensional stock + active scope. Every query on this screen is bound to
+  // ONE warehouse, and every adjustment names the bin/lot it touches.
+  const [balances, setBalances] = useState<StockBalance[]>([]);
+  const [scope, setScope] = useState<StockScope>({ tenantCode: '', warehouseCode: '' });
+  const [adjustBin, setAdjustBin] = useState<string>('');
+  const [adjustLot, setAdjustLot] = useState<string>('');
+  const [adjustStatus, setAdjustStatus] = useState<'AVAILABLE' | 'QUARANTINE' | 'DAMAGED'>('AVAILABLE');
+  const [overrideError, setOverrideError] = useState<string>('');
   const [tableScrollTop, setTableScrollTop] = useState(0);
   const ROW_HEIGHT = 44;
   const VIEWPORT_HEIGHT = 480;
 
   const loadInventory = useCallback(async () => {
-    const items = await db.inventory.toArray();
+    const active = await getStockScope(await getActiveWarehouseCode());
+    setScope(active);
+    const pair = [active.tenantCode, active.warehouseCode] as [string, string];
+    const [items, bals] = await Promise.all([
+      db.inventory.where('[tenantCode+warehouseCode]').equals(pair).toArray(),
+      db.stockBalances.where('[tenantCode+warehouseCode]').equals(pair).toArray(),
+    ]);
     setInventory(items);
+    setBalances(bals);
   }, []);
 
   const loadMovements = useCallback(async () => {
-    const movs = await db.inventoryMovements.reverse().limit(100).toArray();
+    const active = await getStockScope(await getActiveWarehouseCode());
+    const movs = await db.inventoryMovements
+      .where('[tenantCode+warehouseCode]')
+      .equals([active.tenantCode, active.warehouseCode])
+      .reverse()
+      .limit(100)
+      .toArray();
     setMovements(movs);
   }, []);
 
@@ -72,6 +95,19 @@ export default function InventoryHub() {
     loadInventory();
     loadMovements();
   }, [loadInventory, loadMovements]);
+
+  /** Every physical dimension of one SKU inside the active warehouse. */
+  const dimensionsFor = useCallback(
+    (sku: string) =>
+      balances
+        .filter((b) => b.sku === sku)
+        .sort(
+          (a, b) =>
+            (a.expiryDate ?? '9999-12-31').localeCompare(b.expiryDate ?? '9999-12-31') ||
+            a.location.localeCompare(b.location),
+        ),
+    [balances],
+  );
 
   // AnomalySentinel + Oracle when inventory changes
   useEffect(() => {
@@ -161,7 +197,9 @@ export default function InventoryHub() {
 
   const isLowStock = (item: InventoryItem) => {
     const threshold = item.reorderPoint ?? 10;
-    return (item.stock || 0) <= threshold;
+    // Reorder pressure is driven by SELLABLE stock: units already reserved or
+    // quarantined cannot satisfy the next order.
+    return (item.availableStock ?? item.stock ?? 0) <= threshold;
   };
 
   const lowStockCount = inventory.filter(isLowStock).length;
@@ -174,19 +212,69 @@ export default function InventoryHub() {
     const newStock = parseInt(editStock, 10);
     if (isNaN(newStock) || newStock < 0) return;
     const prev = inventory.find((i) => i.id === id);
-    const delta = newStock - (prev?.stock || 0);
-    await db.inventory.update(id, { stock: newStock, updatedAt: new Date().toISOString() });
-    if (prev && delta !== 0) {
-      await logInventoryMovement(prev.sku, 'adjustment', Math.abs(delta), user?.displayName || 'Supervisor', {
-        toLocation: prev.location,
-        note: `Direct stock override ${prev.stock ?? 0} -> ${newStock}`,
+    if (!prev) {
+      setEditingId(null);
+      return;
+    }
+
+    const delta = newStock - (prev.stock || 0);
+    if (delta === 0) {
+      setEditingId(null);
+      return;
+    }
+
+    // A rollup is never writable on its own: the correction is posted against a
+    // named bin/lot dimension so the ledger, FEFO and the cloud stay consistent.
+    const dims = dimensionsFor(prev.sku).filter((d) => d.stockStatus === 'AVAILABLE');
+    const target = dims[0];
+    if (!target) {
+      setOverrideError(
+        `${prev.sku} has no AVAILABLE bin dimension in ${scope.warehouseCode}. Open "Adjust" and name the bin and lot to correct.`,
+      );
+      setEditingId(null);
+      return;
+    }
+
+    try {
+      await upsertDimension({
+        scope,
+        sku: prev.sku,
+        location: target.location,
+        lotNumber: target.lotNumber,
+        stockStatus: 'AVAILABLE',
+        expiryDate: target.expiryDate ?? null,
+        qtyDelta: delta,
+        operator: user?.displayName || 'Supervisor',
+        movementType: 'adjustment',
+        note: `Stock correction ${prev.stock ?? 0} -> ${newStock} posted to ${target.location}/${target.lotNumber}`,
       });
       await logAction(
         'INVENTORY_STOCK_OVERRIDE',
-        `Overrode ${prev.sku} stock from ${prev.stock ?? 0} to ${newStock}`,
-        user?.displayName || 'Supervisor'
+        `Corrected ${prev.sku} from ${prev.stock ?? 0} to ${newStock} via ${target.location}/${target.lotNumber} (${scope.warehouseCode})`,
+        user?.displayName || 'Supervisor',
       );
+      void enqueueCloudOperation(
+        'stock_movement',
+        {
+          sku: prev.sku,
+          qtyDelta: delta,
+          transactionType: 'adjustment',
+          location: target.location,
+          lotNumber: target.lotNumber,
+          stockStatus: 'AVAILABLE',
+          expiryDate: target.expiryDate ?? null,
+          operator: user?.displayName || 'Supervisor',
+          note: 'Stock correction from Inventory Hub',
+          tenantCode: scope.tenantCode,
+          warehouseCode: scope.warehouseCode,
+        },
+        `adj:${scope.warehouseCode}:${prev.sku}:${target.location}:${target.lotNumber}:${Date.now()}`,
+      );
+      setOverrideError('');
+    } catch (err) {
+      setOverrideError(err instanceof Error ? err.message : 'Correction refused');
     }
+
     setEditingId(null);
     loadInventory();
     loadMovements();
@@ -196,17 +284,61 @@ export default function InventoryHub() {
     if (!adjustItem || !adjustQty || !canAdjustStock) return;
     const delta = parseInt(adjustQty, 10);
     if (isNaN(delta) || delta === 0) return;
-    const newStock = Math.max(0, (adjustItem.stock || 0) + delta);
-    await db.inventory.update(adjustItem.id!, { stock: newStock, updatedAt: new Date().toISOString() });
-    await logInventoryMovement(adjustItem.sku, 'adjustment', Math.abs(delta), user?.displayName || 'Supervisor', {
-      note: `${delta > 0 ? '+' : ''}${delta} | ${adjustReason || 'Manual adjustment'}`,
-    });
-    await logAction('INVENTORY_ADJUST', `Adjusted ${adjustItem.sku} by ${delta}: ${adjustReason}`, user?.displayName || 'Unknown');
-    setAdjustItem(null);
-    setAdjustQty('');
-    setAdjustReason('');
-    loadInventory();
-    loadMovements();
+
+    // The operator must name the exact bin, lot and status being corrected.
+    const bin = adjustBin.trim().toUpperCase();
+    const lot = adjustLot.trim() || 'DEFAULT';
+    if (!bin) {
+      setOverrideError('Select or enter the bin this adjustment applies to.');
+      return;
+    }
+
+    try {
+      await upsertDimension({
+        scope,
+        sku: adjustItem.sku,
+        location: bin,
+        lotNumber: lot,
+        stockStatus: adjustStatus,
+        qtyDelta: delta,
+        operator: user?.displayName || 'Supervisor',
+        movementType: adjustStatus === 'AVAILABLE' ? 'adjustment' : 'qc_adjustment',
+        note: `${delta > 0 ? '+' : ''}${delta} | ${adjustReason || 'Manual adjustment'}`,
+      });
+      await refreshInventoryRollup(adjustItem.sku, scope);
+      await logAction(
+        'INVENTORY_ADJUST',
+        `Adjusted ${adjustItem.sku} by ${delta} at ${bin}/${lot} [${adjustStatus}] in ${scope.warehouseCode}: ${adjustReason || 'manual'}`,
+        user?.displayName || 'Unknown',
+      );
+      void enqueueCloudOperation(
+        'stock_movement',
+        {
+          sku: adjustItem.sku,
+          qtyDelta: delta,
+          transactionType: adjustStatus === 'AVAILABLE' ? 'adjustment' : 'qc_adjustment',
+          location: bin,
+          lotNumber: lot,
+          stockStatus: adjustStatus,
+          operator: user?.displayName || 'Supervisor',
+          note: adjustReason || 'Manual adjustment',
+          tenantCode: scope.tenantCode,
+          warehouseCode: scope.warehouseCode,
+        },
+        `adj:${scope.warehouseCode}:${adjustItem.sku}:${bin}:${lot}:${adjustStatus}:${Date.now()}`,
+      );
+      setOverrideError('');
+      setAdjustItem(null);
+      setAdjustQty('');
+      setAdjustReason('');
+      setAdjustBin('');
+      setAdjustLot('');
+      setAdjustStatus('AVAILABLE');
+      loadInventory();
+      loadMovements();
+    } catch (err) {
+      setOverrideError(err instanceof Error ? err.message : 'Adjustment refused');
+    }
   };
 
   const getLocationZone = (location: string) => location.split('-')[0] || location;
@@ -744,12 +876,18 @@ export default function InventoryHub() {
 
               <div className="grid grid-cols-2 gap-3 mb-4">
                 <div className="bg-white/[0.02] rounded-md p-3">
-                  <p className="text-[10px] text-text-secondary uppercase tracking-widest">Stock</p>
-                  <p className="text-lg font-bold text-text-primary">{detailItem.stock}</p>
+                  <p className="text-[10px] text-text-secondary uppercase tracking-widest">On hand / sellable</p>
+                  <p className="text-lg font-bold text-text-primary">
+                    {detailItem.stock ?? 0}
+                    <span className="text-accent-green text-sm"> / {detailItem.availableStock ?? detailItem.stock ?? 0}</span>
+                  </p>
                 </div>
                 <div className="bg-white/[0.02] rounded-md p-3">
-                  <p className="text-[10px] text-text-secondary uppercase tracking-widest">Location</p>
-                  <p className="text-lg font-bold text-text-primary font-mono">{detailItem.location}</p>
+                  <p className="text-[10px] text-text-secondary uppercase tracking-widest">Bins / lots</p>
+                  <p className="text-lg font-bold text-text-primary font-mono">
+                    {detailItem.binCount ?? dimensionsFor(detailItem.sku).length}
+                    <span className="text-text-secondary text-sm"> / {detailItem.lotNumbers?.length ?? (detailItem.lotNumber ? 1 : 0)}</span>
+                  </p>
                 </div>
                 <div className="bg-white/[0.02] rounded-md p-3">
                   <p className="text-[10px] text-text-secondary uppercase tracking-widest">Value</p>
@@ -759,6 +897,66 @@ export default function InventoryHub() {
                   <p className="text-[10px] text-text-secondary uppercase tracking-widest">ABC Class</p>
                   <p className={`text-lg font-bold ${getABCColor(getABCClass(detailItem))}`}>{getABCClass(detailItem)}</p>
                 </div>
+              </div>
+
+              {/* Physical stock dimensions — the authoritative granularity view */}
+              <div className="mb-4">
+                <p className="text-[10px] text-text-secondary uppercase tracking-widest mb-2 flex items-center gap-1">
+                  <MapPin className="w-3 h-3" />
+                  Stock dimensions — {scope.warehouseCode}
+                </p>
+                {dimensionsFor(detailItem.sku).length === 0 ? (
+                  <p className="text-xs text-text-secondary py-2">
+                    No balance rows for this SKU in {scope.warehouseCode || 'the active warehouse'}. Stock shown above is
+                    a local rollup only.
+                  </p>
+                ) : (
+                  <div className="space-y-1 max-h-48 overflow-y-auto pr-1">
+                    {dimensionsFor(detailItem.sku).map((d) => {
+                      const sellable = Math.max(0, d.onHandQty - d.reservedQty - d.quarantineQty);
+                      const expired = d.expiryDate ? daysUntilExpiry(d.expiryDate) ?? 0 : null;
+                      return (
+                        <div
+                          key={`${d.location}|${d.lotNumber}|${d.stockStatus}|${d.serialNumber ?? ''}`}
+                          className={`flex items-center gap-2 text-[10px] p-2 rounded-md border ${
+                            d.stockStatus === 'AVAILABLE'
+                              ? 'bg-white/[0.02] border-white/[0.05]'
+                              : 'bg-accent-red/5 border-accent-red/15'
+                          }`}
+                        >
+                          <span className="font-mono text-text-primary font-semibold">{d.location}</span>
+                          <span className="font-mono text-text-secondary">LOT {d.lotNumber}</span>
+                          <span
+                            className={`font-mono ${
+                              d.stockStatus === 'AVAILABLE'
+                                ? 'text-accent-green'
+                                : d.stockStatus === 'QUARANTINE'
+                                  ? 'text-accent-yellow'
+                                  : 'text-accent-red'
+                            }`}
+                          >
+                            {d.stockStatus}
+                          </span>
+                          {d.expiryDate && (
+                            <span className={`font-mono ${expired !== null && expired < 0 ? 'text-accent-red' : 'text-text-secondary'}`}>
+                              exp {d.expiryDate}
+                            </span>
+                          )}
+                          {d.serialNumber && <span className="font-mono text-accent-sky">SN {d.serialNumber}</span>}
+                          <span className="ml-auto font-mono text-text-primary">
+                            {sellable} sellable / {d.onHandQty} on hand
+                            {d.reservedQty > 0 ? ` · ${d.reservedQty} res` : ''}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                {dimensionsFor(detailItem.sku).filter((d) => d.stockStatus === 'AVAILABLE').length > 1 && (
+                  <p className="text-[10px] text-accent-sky/80 mt-1.5">
+                    Multi-bin SKU: FEFO will consume the soonest usable expiry first, then the lowest pick sequence.
+                  </p>
+                )}
               </div>
 
               <div className="space-y-2 mb-4">
@@ -831,7 +1029,81 @@ export default function InventoryHub() {
                 <h3 className="text-sm font-bold text-text-primary">Adjust Stock</h3>
                 <button onClick={() => setAdjustItem(null)} className="p-1 text-text-secondary hover:text-text-primary"><X className="w-5 h-5" /></button>
               </div>
-              <p className="text-xs text-text-secondary mb-4">{adjustItem.sku} — Current: <span className="text-text-primary font-bold">{adjustItem.stock}</span></p>
+              <p className="text-xs text-text-secondary mb-2">
+                {adjustItem.sku} — on hand <span className="text-text-primary font-bold">{adjustItem.stock ?? 0}</span>
+                {' · '}sellable <span className="text-accent-green font-bold">{adjustItem.availableStock ?? adjustItem.stock ?? 0}</span>
+                {' · '}reserved <span className="text-accent-yellow font-bold">{adjustItem.reservedStock ?? 0}</span>
+                {' · '}blocked <span className="text-accent-red font-bold">{adjustItem.quarantineStock ?? 0}</span>
+              </p>
+              <p className="text-[10px] text-text-secondary/70 font-mono mb-4">{scope.warehouseCode} · {scope.tenantCode}</p>
+
+              {/* Physical dimensions: the adjustment must name one of them. */}
+              <div className="mb-3">
+                <label className="block text-[10px] text-text-secondary uppercase tracking-widest mb-1">Bin / lot dimension</label>
+                {dimensionsFor(adjustItem.sku).length === 0 ? (
+                  <input
+                    type="text"
+                    value={adjustBin}
+                    onChange={(e) => setAdjustBin(e.target.value.toUpperCase())}
+                    className="w-full bg-white/[0.03] border border-white/[0.08] rounded-md px-3 py-2 text-sm text-text-primary font-mono focus:outline-none focus:border-accent-sky"
+                    placeholder="PHONE-A-01-01"
+                  />
+                ) : (
+                  <select
+                    value={adjustBin ? `${adjustBin}|${adjustLot}` : ''}
+                    onChange={(e) => {
+                      const [bin, lot] = e.target.value.split('|');
+                      setAdjustBin(bin || '');
+                      setAdjustLot(lot || '');
+                    }}
+                    className="w-full bg-white/[0.03] border border-white/[0.08] rounded-md px-3 py-2 text-xs text-text-primary font-mono focus:outline-none focus:border-accent-sky"
+                  >
+                    <option value="" className="bg-[#0c0c14]">Select a bin / lot…</option>
+                    {dimensionsFor(adjustItem.sku).map((d) => (
+                      <option key={`${d.location}|${d.lotNumber}|${d.stockStatus}`} value={`${d.location}|${d.lotNumber}`} className="bg-[#0c0c14]">
+                        {d.location} · LOT {d.lotNumber} · {d.stockStatus} · {d.onHandQty} on hand
+                        {d.expiryDate ? ` · exp ${d.expiryDate}` : ''}
+                      </option>
+                    ))}
+                  </select>
+                )}
+                <div className="grid grid-cols-2 gap-2 mt-2">
+                  <input
+                    type="text"
+                    value={adjustBin}
+                    onChange={(e) => setAdjustBin(e.target.value.toUpperCase())}
+                    className="bg-white/[0.03] border border-white/[0.08] rounded-md px-3 py-2 text-xs text-text-primary font-mono focus:outline-none focus:border-accent-sky"
+                    placeholder="BIN CODE"
+                  />
+                  <input
+                    type="text"
+                    value={adjustLot}
+                    onChange={(e) => setAdjustLot(e.target.value.toUpperCase())}
+                    className="bg-white/[0.03] border border-white/[0.08] rounded-md px-3 py-2 text-xs text-text-primary font-mono focus:outline-none focus:border-accent-sky"
+                    placeholder="LOT"
+                  />
+                </div>
+              </div>
+
+              <div className="mb-3">
+                <label className="block text-[10px] text-text-secondary uppercase tracking-widest mb-1">Stock status</label>
+                <div className="grid grid-cols-3 gap-2">
+                  {(['AVAILABLE', 'QUARANTINE', 'DAMAGED'] as const).map((st) => (
+                    <button
+                      key={st}
+                      onClick={() => setAdjustStatus(st)}
+                      className={`px-2 py-1.5 rounded-md text-[10px] font-mono border transition-all ${
+                        adjustStatus === st
+                          ? 'bg-accent-sky/20 border-accent-sky/40 text-accent-sky'
+                          : 'bg-white/[0.02] border-white/[0.06] text-text-secondary hover:text-text-primary'
+                      }`}
+                    >
+                      {st}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
               <div className="mb-3">
                 <label className="block text-[10px] text-text-secondary uppercase tracking-widest mb-1">Adjustment (+/-)</label>
                 <input type="number" value={adjustQty} onChange={(e) => setAdjustQty(e.target.value)} className="w-full bg-white/[0.03] border border-white/[0.08] rounded-md px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-accent-sky" placeholder="+5 or -3" />
@@ -840,7 +1112,16 @@ export default function InventoryHub() {
                 <label className="block text-[10px] text-text-secondary uppercase tracking-widest mb-1">Reason</label>
                 <input type="text" value={adjustReason} onChange={(e) => setAdjustReason(e.target.value)} className="w-full bg-white/[0.03] border border-white/[0.08] rounded-md px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-accent-sky" placeholder="Damage, found, etc." />
               </div>
-              <button onClick={handleAdjustment} className="w-full py-2.5 bg-accent-sky text-void font-semibold text-sm rounded-md hover:bg-accent-sky/90 transition-colors">Apply Adjustment</button>
+              {overrideError && (
+                <p className="text-[11px] text-accent-red bg-accent-red/10 border border-accent-red/20 rounded-md px-3 py-2 mb-3">{overrideError}</p>
+              )}
+              <button
+                onClick={handleAdjustment}
+                disabled={!adjustBin.trim()}
+                className="w-full py-2.5 bg-accent-sky text-void font-semibold text-sm rounded-md hover:bg-accent-sky/90 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                Apply Adjustment
+              </button>
             </motion.div>
           </motion.div>
         )}

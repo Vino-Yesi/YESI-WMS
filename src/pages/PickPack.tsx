@@ -1,7 +1,9 @@
 import { useState, useCallback, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { db } from '@/lib/db';
+import { db, type StockBalance } from '@/lib/db';
 import { confirmPickAndPackTransactional } from '@/lib/lifecycle';
+import { getStockScope } from '@/lib/stockBalances';
+import { getActiveWarehouseCode } from '@/lib/supabaseSync';
 import { useAuth } from '@/lib/auth';
 import BarcodeReader from '@/components/BarcodeReader';
 import StatusBadge from '@/components/StatusBadge';
@@ -12,6 +14,16 @@ interface RequiredItem {
   sku: string;
   quantity: number;
   picked: number;
+  /** Raw scans captured for this line, in scan order (one per unit). */
+  scans: string[];
+}
+
+/** FEFO bin guidance for one SKU line inside the active warehouse. */
+interface BinHint {
+  location: string;
+  lotNumber: string;
+  expiryDate: string | null;
+  available: number;
 }
 
 export default function PickPack() {
@@ -25,14 +37,25 @@ export default function PickPack() {
   const [pickMode, setPickMode] = useState<'standard' | 'wave'>('standard');
   const [waveOrders, setWaveOrders] = useState<Order[]>([]);
   const [wavePicks, setWavePicks] = useState<Record<string, number>>({});
+  const [waveScans, setWaveScans] = useState<Record<string, string[]>>({});
+  const [warehouse, setWarehouse] = useState<string>('');
+  const [tenantCode, setTenantCode] = useState<string>('');
+  const [balances, setBalances] = useState<StockBalance[]>([]);
 
   const loadData = useCallback(async () => {
-    const [ords, inv] = await Promise.all([
-      db.orders.toArray(),
-      db.inventory.toArray(),
+    // Strict warehouse scoping: a picker in SHJ-HUB2 must never see or confirm
+    // DXB-FC1 stock.
+    const scope = await getStockScope(await getActiveWarehouseCode());
+    const [ords, inv, bals] = await Promise.all([
+      db.orders.where('[tenantCode+warehouseCode]').equals([scope.tenantCode, scope.warehouseCode]).toArray(),
+      db.inventory.where('[tenantCode+warehouseCode]').equals([scope.tenantCode, scope.warehouseCode]).toArray(),
+      db.stockBalances.where('[tenantCode+warehouseCode]').equals([scope.tenantCode, scope.warehouseCode]).toArray(),
     ]);
+    setTenantCode(scope.tenantCode);
+    setWarehouse(scope.warehouseCode);
     setOrders(ords);
     setInventory(inv);
+    setBalances(bals);
   }, []);
 
   useEffect(() => {
@@ -47,8 +70,56 @@ export default function PickPack() {
     for (const sku of skus) {
       counts[sku] = (counts[sku] || 0) + 1;
     }
-    return Object.entries(counts).map(([sku, quantity]) => ({ sku, quantity, picked: 0 }));
+    return Object.entries(counts).map(([sku, quantity]) => ({ sku, quantity, picked: 0, scans: [] }));
   };
+
+  /**
+   * FEFO bin hints for a SKU: every bin that holds allocatable units of it,
+   * soonest usable expiry first. A SKU split across three bins shows three rows,
+   * so the picker walks the correct aisle instead of guessing.
+   */
+  const getBinHints = useCallback(
+    (sku: string): BinHint[] => {
+      const rows = balances
+        .filter((b) => b.sku === sku && b.stockStatus === 'AVAILABLE')
+        .map((b) => ({
+          location: b.location,
+          lotNumber: b.lotNumber,
+          expiryDate: b.expiryDate ?? null,
+          available: Math.max(0, b.onHandQty - b.reservedQty - b.quarantineQty),
+        }))
+        .filter((b) => b.available > 0)
+        .sort((a, b) =>
+          (a.expiryDate ?? '9999-12-31').localeCompare(b.expiryDate ?? '9999-12-31') ||
+          a.location.localeCompare(b.location),
+        );
+      return rows;
+    },
+    [balances],
+  );
+
+  /** Resolves a scanned barcode / serial / lot into the SKU it belongs to. */
+  const resolveScan = useCallback(
+    async (code: string): Promise<{ sku: string; location?: string; lotNumber?: string; kind: 'sku' | 'barcode' | 'serial' | 'lot' } | null> => {
+      const clean = code.trim();
+      if (!clean) return null;
+
+      const serial = await db.serialNumbers.where('serialNumber').equals(clean).first();
+      if (serial) return { sku: serial.sku, location: serial.location, kind: 'serial' };
+
+      const byBarcode = inventory.find((i) => i.barcode === clean || i.rfidTag === clean);
+      if (byBarcode) return { sku: byBarcode.sku, location: byBarcode.location, lotNumber: byBarcode.lotNumber, kind: 'barcode' };
+
+      const bySku = inventory.find((i) => i.sku === clean);
+      if (bySku) return { sku: bySku.sku, location: bySku.location, lotNumber: bySku.lotNumber, kind: 'sku' };
+
+      const dim = balances.find((b) => b.lotNumber.toUpperCase() === clean.toUpperCase());
+      if (dim) return { sku: dim.sku, location: dim.location, lotNumber: dim.lotNumber, kind: 'lot' };
+
+      return null;
+    },
+    [inventory, balances],
+  );
 
   const getProductName = (sku: string) => {
     const item = inventory.find(i => i.sku === sku);
@@ -56,70 +127,102 @@ export default function PickPack() {
   };
 
   const getItemLocation = (sku: string) => {
+    const hints = getBinHints(sku);
+    if (hints.length > 0) return hints[0].location;
     const item = inventory.find(i => i.sku === sku);
     return item?.location || 'UNASSIGNED';
   };
 
-  const handleScan = (code: string) => {
+  const handleScan = async (code: string) => {
     if (pickMode === 'wave' && waveOrders.length > 0) {
-      handleWaveScan(code);
+      await handleWaveScan(code);
       return;
     }
     if (!selectedOrder) return;
-    
+
+    // A scanner yields a barcode, IMEI/serial or lot label — not necessarily the
+    // SKU code. Resolve it first so the raw scan can be replayed to the server
+    // for verification.
+    const resolved = await resolveScan(code);
+    if (!resolved) {
+      setMessage({ type: 'error', text: `Scan "${code}" is not registered in ${warehouse}` });
+      return;
+    }
+
     const items = getRequiredItems(selectedOrder);
-    const requiredSku = items.find(item => item.sku === code);
-    
+    const requiredSku = items.find(item => item.sku === resolved.sku);
+
     if (!requiredSku) {
-      setMessage({ type: 'error', text: `SKU ${code} not required for this order` });
+      setMessage({ type: 'error', text: `${resolved.sku} (scan ${code}) is not required for this order` });
       return;
     }
-    
-    const currentItem = requiredItems.find(r => r.sku === code);
+
+    const currentItem = requiredItems.find(r => r.sku === resolved.sku);
     const currentPicked = currentItem?.picked || 0;
-    
+
     if (currentPicked >= requiredSku.quantity) {
-      setMessage({ type: 'warning', text: `All ${requiredSku.quantity} units of ${code} already picked` });
+      setMessage({ type: 'warning', text: `All ${requiredSku.quantity} units of ${resolved.sku} already picked` });
       return;
     }
-    
-    // Check stock availability
-    const invItem = inventory.find(i => i.sku === code);
-    if (!invItem || (invItem.stock || 0) <= 0) {
-      setMessage({ type: 'error', text: `SKU ${code} is out of stock!` });
+
+    // Duplicate scan guard: the same physical unit cannot be picked twice.
+    if (currentItem?.scans.includes(code)) {
+      setMessage({ type: 'warning', text: `Scan ${code} was already counted for ${resolved.sku}` });
       return;
     }
-    
+
+    // Bin-level availability, not a per-SKU total.
+    const hints = getBinHints(resolved.sku);
+    const freeUnits = hints.reduce((sum, h) => sum + h.available, 0);
+    if (freeUnits <= 0) {
+      setMessage({ type: 'error', text: `${resolved.sku} has no allocatable units in ${warehouse}` });
+      return;
+    }
+    const nextBin = hints.find(h => h.available > currentPicked) ?? hints[0];
+
     setRequiredItems(prev => {
-      const existing = prev.find(p => p.sku === code);
+      const existing = prev.find(p => p.sku === resolved.sku);
       if (existing) {
-        return prev.map(p => p.sku === code ? { ...p, picked: p.picked + 1 } : p);
+        return prev.map(p =>
+          p.sku === resolved.sku ? { ...p, picked: p.picked + 1, scans: [...p.scans, code] } : p,
+        );
       }
-      return [...prev, { sku: code, quantity: requiredSku.quantity, picked: 1 }];
+      return [...prev, { sku: resolved.sku, quantity: requiredSku.quantity, picked: 1, scans: [code] }];
     });
-    
+
     triggerRipple();
-    setMessage({ type: 'success', text: `Picked 1x ${code}` });
+    setMessage({
+      type: 'success',
+      text: `Picked 1× ${resolved.sku} from ${nextBin.location}/${nextBin.lotNumber}${nextBin.expiryDate ? ` (exp ${nextBin.expiryDate})` : ''} — scan ${resolved.kind}`,
+    });
   };
 
-  const handleWaveScan = (code: string) => {
+  const handleWaveScan = async (code: string) => {
+    const resolved = await resolveScan(code);
+    if (!resolved) {
+      setMessage({ type: 'error', text: `Scan "${code}" is not registered in ${warehouse}` });
+      return;
+    }
+    const sku = resolved.sku;
     const allRequired = waveOrders.flatMap(o => getRequiredItems(o));
-    const needed = allRequired.find(r => r.sku === code && (wavePicks[code] || 0) < r.quantity);
-    
+    const needed = allRequired.find(r => r.sku === sku && (wavePicks[sku] || 0) < r.quantity);
+
     if (!needed) {
-      setMessage({ type: 'error', text: `SKU ${code} not needed in current wave` });
+      setMessage({ type: 'error', text: `${sku} (scan ${code}) is not needed in the current wave` });
       return;
     }
-    
-    const invItem = inventory.find(i => i.sku === code);
-    if (!invItem || (invItem.stock || 0) <= 0) {
-      setMessage({ type: 'error', text: `SKU ${code} is out of stock!` });
+
+    const hints = getBinHints(sku);
+    const freeUnits = hints.reduce((sum, h) => sum + h.available, 0);
+    if (freeUnits - (wavePicks[sku] || 0) <= 0) {
+      setMessage({ type: 'error', text: `${sku} has no remaining allocatable units in ${warehouse}` });
       return;
     }
-    
-    setWavePicks(prev => ({ ...prev, [code]: (prev[code] || 0) + 1 }));
+
+    setWavePicks(prev => ({ ...prev, [sku]: (prev[sku] || 0) + 1 }));
+    setWaveScans(prev => ({ ...prev, [sku]: [...(prev[sku] || []), code] }));
     triggerRipple();
-    setMessage({ type: 'success', text: `Wave pick: ${code}` });
+    setMessage({ type: 'success', text: `Wave pick: ${sku} from ${hints[0]?.location ?? 'FEFO bin'} (scan ${resolved.kind})` });
   };
 
   const triggerRipple = () => {
@@ -146,9 +249,23 @@ export default function PickPack() {
     try {
       await confirmPickAndPackTransactional({
         orderRecordId: selectedOrder.id,
-        pickedItems: requiredItems.map((r) => ({ sku: r.sku, picked: r.picked })),
+        pickedItems: requiredItems.map((r) => {
+          const hints = getBinHints(r.sku);
+          const bin = hints[0];
+          return {
+            sku: r.sku,
+            picked: r.picked,
+            // The last scan captured for the line is replayed to the server so
+            // the cloud RPC performs the same verification.
+            scannedCode: r.scans[r.scans.length - 1],
+            location: bin?.location,
+            lotNumber: bin?.lotNumber,
+          };
+        }),
         operator: user?.displayName || 'Operator',
         operatorRole: user?.role || 'operator',
+        tenantCode,
+        warehouseCode: warehouse,
       });
       setMessage({
         type: 'success',
@@ -168,6 +285,7 @@ export default function PickPack() {
     const wave = pendingOrders.slice(0, 3);
     setWaveOrders(wave);
     setWavePicks({});
+    setWaveScans({});
     setPickMode('wave');
     setMessage({ type: 'success', text: `Wave created with ${wave.length} orders` });
     
@@ -192,15 +310,29 @@ export default function PickPack() {
         if (allPicked) {
           await confirmPickAndPackTransactional({
             orderRecordId: order.id,
-            pickedItems: items.map((i) => ({ sku: i.sku, picked: i.quantity })),
+            pickedItems: items.map((i) => {
+              const hints = getBinHints(i.sku);
+              const bin = hints[0];
+              const scans = waveScans[i.sku] || [];
+              return {
+                sku: i.sku,
+                picked: i.quantity,
+                scannedCode: scans[scans.length - 1],
+                location: bin?.location,
+                lotNumber: bin?.lotNumber,
+              };
+            }),
             operator: user?.displayName || 'Operator',
             operatorRole: user?.role || 'operator',
+            tenantCode,
+            warehouseCode: warehouse,
           });
           packedCount++;
         }
       }
       setWaveOrders([]);
       setWavePicks({});
+      setWaveScans({});
       setPickMode('standard');
       loadData();
       setMessage({
@@ -360,6 +492,9 @@ export default function PickPack() {
               <h2 className="text-sm font-semibold text-text-primary">
                 {pickMode === 'wave' ? 'Wave Picking' : `Order: ${selectedOrder?.orderId}`}
               </h2>
+              <span className="text-[9px] px-1.5 py-0.5 rounded bg-accent-sky/10 text-accent-sky font-mono">
+                {warehouse}
+              </span>
               <button
                 onClick={() => { setSelectedOrder(null); setRequiredItems([]); setMessage(null); setPickMode('standard'); }}
                 className="ml-auto text-[10px] text-text-secondary hover:text-text-primary flex items-center gap-1"
@@ -440,7 +575,52 @@ export default function PickPack() {
                           <p className={`text-[10px] ${isComplete ? 'line-through text-text-secondary/60' : 'text-text-secondary'}`}>
                             {getProductName(req.sku)}
                           </p>
-                          <p className="text-[10px] text-accent-sky font-mono">{getItemLocation(req.sku)}</p>
+                          {/* FEFO bin walk-list: one row per bin that actually
+                              holds allocatable units, soonest expiry first. */}
+                          <div className="mt-1 space-y-0.5">
+                            {(() => {
+                              const hints = getBinHints(req.sku);
+                              if (hints.length === 0) {
+                                return (
+                                  <p className="text-[10px] text-accent-red font-mono">
+                                    NO ALLOCATABLE STOCK IN {warehouse}
+                                  </p>
+                                );
+                              }
+                              let stillNeeded = req.quantity;
+                              return hints.slice(0, 4).map((h) => {
+                                const takeFromBin = Math.max(0, Math.min(h.available, stillNeeded));
+                                stillNeeded -= takeFromBin;
+                                return (
+                                  <p
+                                    key={`${h.location}|${h.lotNumber}`}
+                                    className={`text-[10px] font-mono flex items-center gap-1.5 ${
+                                      takeFromBin > 0 ? 'text-accent-sky' : 'text-text-secondary/70'
+                                    }`}
+                                  >
+                                    <span className="font-semibold">{h.location}</span>
+                                    <span className="text-text-secondary">LOT {h.lotNumber}</span>
+                                    {h.expiryDate && (
+                                      <span className="text-accent-yellow">EXP {h.expiryDate}</span>
+                                    )}
+                                    <span className="ml-auto">
+                                      {takeFromBin > 0 ? `pick ${takeFromBin}` : `${h.available} free`}
+                                    </span>
+                                  </p>
+                                );
+                              });
+                            })()}
+                            {getBinHints(req.sku).length > 4 && (
+                              <p className="text-[9px] text-text-secondary">
+                                +{getBinHints(req.sku).length - 4} more bin(s)
+                              </p>
+                            )}
+                          </div>
+                          {current && current.scans.length > 0 && (
+                            <p className="text-[9px] text-text-secondary/70 font-mono mt-1">
+                              scans: {current.scans.slice(-3).join(', ')}
+                            </p>
+                          )}
                         </div>
                         <span className="text-xs font-semibold text-text-primary">{picked}/{req.quantity}</span>
                       </motion.div>

@@ -1,6 +1,14 @@
-/* eslint-disable react-refresh/only-export-components */
 import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
-import { db, logAction, type User } from './db';
+import {
+  db,
+  logAction,
+  bootstrapInitialAdmin,
+  requiresBootstrap,
+  rotateLocalPassword,
+  validatePasswordStrength,
+  DEFAULT_TENANT_CODE,
+  type User,
+} from './db';
 import {
   hashPasswordLocal,
   verifyPasswordLocal,
@@ -31,7 +39,26 @@ export interface AuthUser {
   warehouseName?: string;
   allowedWarehouses: string[];
   authMode: 'supabase-pgcrypto' | 'edge-pbkdf2';
+  /**
+   * Server-set flag (migration 008). A legacy/demo credential or a freshly
+   * bootstrapped admin must rotate the password before floor operations run.
+   */
+  mustChangePassword?: boolean;
+  passwordChangedAt?: string | null;
 }
+
+/** Result of `wms_get_bootstrap_status` for the first-run screen. */
+export interface BootstrapStatus {
+  bootstrap_required: boolean;
+  tenant_code: string | null;
+  active_users: number;
+  users_requiring_rotation: number;
+  bootstrap_completed_at: string | null;
+}
+
+export type RotatePasswordResult =
+  | { ok: true; message: string }
+  | { ok: false; code: string; message: string };
 
 interface EncryptedSessionPayload {
   user: AuthUser;
@@ -47,10 +74,21 @@ interface LockoutRecord {
 
 export interface LoginOutcome {
   ok: boolean;
-  code?: 'INVALID_CREDENTIALS' | 'ACCOUNT_LOCKED' | 'WAREHOUSE_FORBIDDEN' | 'TENANT_REQUIRED';
+  code?:
+    | 'INVALID_CREDENTIALS'
+    | 'ACCOUNT_LOCKED'
+    | 'WAREHOUSE_FORBIDDEN'
+    | 'TENANT_REQUIRED'
+    | 'PASSWORD_CHANGE_REQUIRED'
+    | 'BOOTSTRAP_REQUIRED';
   message?: string;
   lockedUntil?: string;
   remainingAttempts?: number;
+  /** Set when the credential is valid but must be rotated before use. */
+  mustChangePassword?: boolean;
+  /** Valid session data, withheld from the app until rotation completes. */
+  pendingUser?: AuthUser;
+  pendingSessionToken?: string | null;
 }
 
 interface AuthContextType {
@@ -59,6 +97,24 @@ interface AuthContextType {
   loginDetailed: (username: string, password: string, warehouseCode?: string) => Promise<LoginOutcome>;
   logout: () => void;
   switchWarehouse: (warehouseCode: string) => Promise<{ ok: boolean; error?: string }>;
+  /** True when the signed-in operator must rotate their credential. */
+  mustChangePassword: boolean;
+  /** First-run bootstrap probe (cloud `wms_get_bootstrap_status`, local fallback). */
+  getBootstrapStatus: () => Promise<BootstrapStatus>;
+  /** Creates the very first administrator; refuses once any account exists. */
+  bootstrapFirstAdmin: (input: {
+    username: string;
+    password: string;
+    displayName?: string;
+    email?: string;
+    warehouseCode?: string;
+  }) => Promise<LoginOutcome>;
+  /** Rotates the signed-in (or pending) operator's credential. */
+  rotatePassword: (input: {
+    currentPassword: string;
+    newPassword: string;
+    username?: string;
+  }) => Promise<RotatePasswordResult>;
   isAdmin: boolean;
   isSupervisor: boolean;
   can: (permission: string) => boolean;
@@ -74,6 +130,16 @@ const AuthContext = createContext<AuthContextType>({
   loginDetailed: async () => ({ ok: false }),
   logout: () => {},
   switchWarehouse: async () => ({ ok: false }),
+  mustChangePassword: false,
+  getBootstrapStatus: async () => ({
+    bootstrap_required: false,
+    tenant_code: null,
+    active_users: 0,
+    users_requiring_rotation: 0,
+    bootstrap_completed_at: null,
+  }),
+  bootstrapFirstAdmin: async () => ({ ok: false, code: 'BOOTSTRAP_REQUIRED', message: 'Auth provider not mounted' }),
+  rotatePassword: async () => ({ ok: false, code: 'AUTH_REQUIRED', message: 'Not authenticated' }),
   isAdmin: false,
   isSupervisor: false,
   can: () => false,
@@ -132,6 +198,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<AuthUser | null>(null);
   const [loading, setLoading] = useState(true);
   const [lastAuthError, setLastAuthError] = useState<string | null>(null);
+  /**
+   * A credential that authenticated successfully but is flagged
+   * `must_change_password`. It is held here instead of being promoted to a live
+   * session, so the operator can rotate it before touching floor data.
+   */
+  const [pendingRotation, setPendingRotation] = useState<{ user: AuthUser; sessionToken: string | null } | null>(null);
   const lastActivityRef = useRef<number>(Date.now());
   const userRef = useRef<AuthUser | null>(null);
 
@@ -143,6 +215,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     safeSessionStorage.removeItem(SESSION_STORAGE_KEY);
     safeLocalStorage.removeItem(LEGACY_LOCALSTORAGE_KEY);
     setActiveServerSessionToken(null);
+    setPendingRotation(null);
     setUser(null);
   }, []);
 
@@ -371,6 +444,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
                 // IndexedDB blocked/unavailable in sandboxed iframe — proceed with verified cloud session
               }
 
+              const mustRotate = Boolean(data.must_change_password ?? u.mustChangePassword);
               const sessionUser: AuthUser = {
                 id: localId,
                 username: u.username || cleanUser,
@@ -381,9 +455,34 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
                 warehouseName: u.warehouseName || 'Fulfillment Center',
                 allowedWarehouses,
                 authMode: 'supabase-pgcrypto',
+                mustChangePassword: mustRotate,
+                passwordChangedAt: u.passwordChangedAt ?? null,
               };
 
               await saveLocalLockout(cleanUser, { count: 0, lockedUntil: 0 });
+
+              // A flagged credential authenticates but is NOT promoted to a live
+              // session: the operator must rotate it first. The verified session
+              // token is retained so the rotation RPC can authorize itself.
+              if (mustRotate) {
+                setPendingRotation({ user: sessionUser, sessionToken: data.session_token || null });
+                setActiveServerSessionToken(data.session_token || null);
+                await logAction(
+                  'PASSWORD_ROTATION_REQUIRED',
+                  `Server flagged ${sessionUser.username} for mandatory credential rotation`,
+                  sessionUser.displayName,
+                );
+                return {
+                  ok: false,
+                  code: 'PASSWORD_CHANGE_REQUIRED',
+                  message:
+                    'This credential is flagged for mandatory rotation (legacy or first-run account). Set a new password to continue.',
+                  mustChangePassword: true,
+                  pendingUser: sessionUser,
+                  pendingSessionToken: data.session_token || null,
+                };
+              }
+
               await persistEncryptedSession(sessionUser, data.session_token || null);
               return { ok: true };
             }
@@ -405,7 +504,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (found && found.id != null) {
         const valid = await verifyPasswordLocal(password, found.password);
         if (valid) {
-          const allowedWarehouses = found.role === 'admin' ? ['DXB-FC1', 'MSK-HUB2'] : [WMS_DEFAULT_WAREHOUSE];
+          // Honour the account's own scope; never invent another site's code.
+          const allowedWarehouses =
+            found.role === 'admin'
+              ? Array.from(new Set([found.warehouseCode || targetWh, WMS_DEFAULT_WAREHOUSE, targetWh]))
+              : [found.warehouseCode || WMS_DEFAULT_WAREHOUSE];
           if (!canAccessWarehouse(found.role, allowedWarehouses, targetWh)) {
             const msg = `Operator ${found.username} is not authorized for warehouse ${targetWh}.`;
             setLastAuthError(msg);
@@ -418,12 +521,30 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             username: found.username,
             role: found.role,
             displayName: found.displayName,
-            tenantCode: WMS_TENANT_CODE,
-            warehouseCode: targetWh,
+            tenantCode: found.tenantCode || WMS_TENANT_CODE,
+            warehouseCode: found.warehouseCode || targetWh,
             allowedWarehouses,
             authMode: 'edge-pbkdf2',
+            mustChangePassword: Boolean(found.mustChangePassword),
           };
           await saveLocalLockout(cleanUser, { count: 0, lockedUntil: 0 });
+
+          if (sessionUser.mustChangePassword) {
+            setPendingRotation({ user: sessionUser, sessionToken: null });
+            await logAction(
+              'PASSWORD_ROTATION_REQUIRED',
+              `Local credential for ${sessionUser.username} is flagged for mandatory rotation`,
+              sessionUser.displayName,
+            );
+            return {
+              ok: false,
+              code: 'PASSWORD_CHANGE_REQUIRED',
+              message: 'This local credential is flagged for mandatory rotation. Set a new password to continue.',
+              mustChangePassword: true,
+              pendingUser: sessionUser,
+            };
+          }
+
           await persistEncryptedSession(sessionUser, null);
           await logAction('LOGIN_EDGE_SUCCESS', `User ${found.username} authenticated offline (${targetWh})`, found.displayName);
           return { ok: true };
@@ -496,6 +617,233 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     [persistEncryptedSession]
   );
 
+  // ─── First-run bootstrap & credential rotation ─────────────────────────
+
+  /**
+   * Reports whether this installation still needs its first administrator.
+   *
+   * Cloud mode asks the service-role-only `wms_get_bootstrap_status` RPC; edge
+   * mode falls back to counting local operator accounts.
+   */
+  const getBootstrapStatus = useCallback(async (): Promise<BootstrapStatus> => {
+    if (isSupabaseConfigured && (typeof navigator === 'undefined' || navigator.onLine)) {
+      try {
+        const { data, error } = await supabase.rpc('wms_get_bootstrap_status', {
+          p_tenant_code: WMS_TENANT_CODE,
+        });
+        if (!error && data) {
+          return {
+            bootstrap_required: Boolean(data.bootstrap_required),
+            tenant_code: data.tenant_code ?? WMS_TENANT_CODE,
+            active_users: Number(data.active_users ?? 0),
+            users_requiring_rotation: Number(data.users_requiring_rotation ?? 0),
+            bootstrap_completed_at: data.bootstrap_completed_at ?? null,
+          };
+        }
+      } catch {
+        // fall through to the local probe
+      }
+    }
+    const needs = await requiresBootstrap();
+    return {
+      bootstrap_required: needs,
+      tenant_code: DEFAULT_TENANT_CODE,
+      active_users: 0,
+      users_requiring_rotation: 0,
+      bootstrap_completed_at: null,
+    };
+  }, []);
+
+  /**
+   * Creates the very first administrator.
+   *
+   * Cloud mode uses the audited `wms_bootstrap_first_admin` RPC, which closes
+   * itself permanently once an active user exists. Edge mode mirrors the same
+   * one-shot guarantee locally. Either way the new admin signs in immediately
+   * and is flagged for rotation only if the server says so.
+   */
+  const bootstrapFirstAdmin = useCallback(
+    async (input: {
+      username: string;
+      password: string;
+      displayName?: string;
+      email?: string;
+      warehouseCode?: string;
+    }): Promise<LoginOutcome> => {
+      const cleanUser = input.username.trim();
+      const targetWh = (input.warehouseCode || WMS_DEFAULT_WAREHOUSE).trim().toUpperCase();
+      const strength = validatePasswordStrength(input.password, cleanUser);
+      if (!strength.ok) {
+        return { ok: false, code: 'INVALID_CREDENTIALS', message: strength.error };
+      }
+
+      if (isSupabaseConfigured && (typeof navigator === 'undefined' || navigator.onLine)) {
+        try {
+          const { data, error } = await supabase.rpc('wms_bootstrap_first_admin', {
+            p_username: cleanUser,
+            p_password: input.password,
+            p_tenant_code: WMS_TENANT_CODE,
+            p_display_name: input.displayName?.trim() || null,
+            p_email: input.email?.trim() || null,
+            p_warehouse_code: targetWh,
+            p_device_id: getDeviceId(),
+            p_user_agent: typeof navigator !== 'undefined' ? navigator.userAgent.slice(0, 180) : 'YESI-WMS',
+          });
+
+          if (error) {
+            return { ok: false, code: 'INVALID_CREDENTIALS', message: error.message };
+          }
+          if (!data?.authenticated) {
+            return {
+              ok: false,
+              code: data?.code === 'BOOTSTRAP_ALREADY_COMPLETED' ? 'BOOTSTRAP_REQUIRED' : 'INVALID_CREDENTIALS',
+              message: data?.error || 'Bootstrap was refused by the server.',
+            };
+          }
+
+          const u = data.user ?? {};
+          const mappedRole: WmsRole = (['admin', 'supervisor', 'operator', 'auditor', 'viewer'].includes(u.role) ? u.role : 'admin') as WmsRole;
+          const sessionUser: AuthUser = {
+            id: u.id ?? cleanUser,
+            username: u.username || cleanUser,
+            role: mappedRole,
+            displayName: u.displayName || input.displayName || cleanUser,
+            tenantCode: u.tenantCode || WMS_TENANT_CODE,
+            warehouseCode: u.warehouseCode || targetWh,
+            warehouseName: u.warehouseName || 'Fulfillment Center',
+            allowedWarehouses: Array.isArray(u.allowedWarehouses) && u.allowedWarehouses.length > 0 ? u.allowedWarehouses : [targetWh],
+            authMode: 'supabase-pgcrypto',
+            mustChangePassword: Boolean(data.must_change_password),
+            passwordChangedAt: u.passwordChangedAt ?? new Date().toISOString(),
+          };
+
+          // Mirror the credential locally so an offline shift can still sign in.
+          try {
+            const localHash = await hashPasswordLocal(input.password);
+            await db.users.add({
+              username: sessionUser.username,
+              password: localHash,
+              role: mappedRole === 'viewer' || mappedRole === 'auditor' ? 'operator' : mappedRole as 'admin' | 'supervisor' | 'operator',
+              displayName: sessionUser.displayName,
+              createdAt: new Date().toISOString(),
+              skillLevel: 5,
+              tenantCode: sessionUser.tenantCode,
+              warehouseCode: sessionUser.warehouseCode,
+              mustChangePassword: false,
+              passwordChangedAt: new Date().toISOString(),
+              createdBy: 'bootstrap',
+            });
+          } catch {
+            // IndexedDB may be blocked; the cloud session is authoritative.
+          }
+
+          setPendingRotation(null);
+          await logAction('ADMIN_BOOTSTRAPPED', `First-run administrator ${sessionUser.username} created for ${targetWh}`, sessionUser.displayName);
+          await persistEncryptedSession(sessionUser, data.session_token || null);
+          return { ok: true };
+        } catch {
+          // fall through to local bootstrap
+        }
+      }
+
+      const local = await bootstrapInitialAdmin({
+        username: cleanUser,
+        password: input.password,
+        displayName: input.displayName,
+        role: 'admin',
+        tenantCode: DEFAULT_TENANT_CODE,
+        warehouseCode: targetWh,
+      });
+      if (!local.ok) {
+        return {
+          ok: false,
+          code: local.code === 'BOOTSTRAP_ALREADY_COMPLETED' ? 'BOOTSTRAP_REQUIRED' : 'INVALID_CREDENTIALS',
+          message: local.error,
+        };
+      }
+
+      const created = await db.users.where('username').equals(cleanUser).first();
+      const sessionUser: AuthUser = {
+        id: created?.id ?? cleanUser,
+        username: cleanUser,
+        role: 'admin',
+        displayName: input.displayName?.trim() || cleanUser,
+        tenantCode: DEFAULT_TENANT_CODE,
+        warehouseCode: targetWh,
+        allowedWarehouses: [targetWh],
+        authMode: 'edge-pbkdf2',
+        mustChangePassword: false,
+        passwordChangedAt: new Date().toISOString(),
+      };
+      setPendingRotation(null);
+      await persistEncryptedSession(sessionUser, null);
+      return { ok: true };
+    },
+    [persistEncryptedSession],
+  );
+
+  /**
+   * Rotates the credential of the signed-in operator, or of an operator whose
+   * login is pending mandatory rotation.
+   *
+   * Cloud mode calls `wms_rotate_operator_password` (which clears the
+   * `must_change_password` flag and revokes other sessions); edge mode rotates
+   * the local PBKDF2 hash. On success a pending operator is promoted to a live
+   * session.
+   */
+  const rotatePassword = useCallback(
+    async (input: { currentPassword: string; newPassword: string; username?: string }): Promise<RotatePasswordResult> => {
+      const target = pendingRotation?.user ?? userRef.current;
+      if (!target) return { ok: false, code: 'AUTH_REQUIRED', message: 'No operator session to rotate' };
+      const targetUser = (input.username || target.username).trim();
+
+      const strength = validatePasswordStrength(input.newPassword, targetUser);
+      if (!strength.ok) return { ok: false, code: strength.code, message: strength.error };
+      if (input.newPassword === input.currentPassword) {
+        return { ok: false, code: 'PASSWORD_UNCHANGED', message: 'The new password must differ from the current one' };
+      }
+
+      if (isSupabaseConfigured && (typeof navigator === 'undefined' || navigator.onLine)) {
+        const token = pendingRotation?.sessionToken ?? getActiveServerSessionToken();
+        if (!token) {
+          return { ok: false, code: 'AUTH_REQUIRED', message: 'A signed session is required to rotate a cloud credential' };
+        }
+        try {
+          const { data, error } = await supabase.rpc('wms_rotate_operator_password', {
+            p_session_token: token,
+            p_tenant_code: target.tenantCode,
+            p_target_username: targetUser,
+            p_new_password: input.newPassword,
+            p_current_password: input.currentPassword || null,
+            p_device_id: getDeviceId(),
+          });
+          if (error) return { ok: false, code: 'ROTATION_FAILED', message: error.message };
+          if (!data?.ok) {
+            return { ok: false, code: String(data?.code || 'ROTATION_FAILED'), message: String(data?.error || 'Rotation refused') };
+          }
+        } catch {
+          // Offline mid-rotation: fall through to the local hash update so the
+          // operator is never locked out of the floor terminal.
+        }
+      }
+
+      const local = await rotateLocalPassword(targetUser, input.currentPassword, input.newPassword);
+      if (!local.ok && !isSupabaseConfigured) {
+        return { ok: false, code: local.code, message: local.error };
+      }
+      if (!local.ok && local.code !== 'CURRENT_PASSWORD_INVALID' && local.code !== 'USER_NOT_FOUND') {
+        return { ok: false, code: local.code, message: local.error };
+      }
+
+      const rotated: AuthUser = { ...target, mustChangePassword: false, passwordChangedAt: new Date().toISOString() };
+      setPendingRotation(null);
+      await persistEncryptedSession(rotated, pendingRotation?.sessionToken ?? getActiveServerSessionToken());
+      await logAction('PASSWORD_ROTATED', `Credential rotated for ${targetUser}`, rotated.displayName);
+      return { ok: true, message: `Password rotated for ${targetUser}` };
+    },
+    [pendingRotation, persistEncryptedSession],
+  );
+
   const updateUser = useCallback(
     (updates: Partial<AuthUser>) => {
       setUser((prev) => {
@@ -525,6 +873,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       loginDetailed,
       logout,
       switchWarehouse,
+      mustChangePassword: Boolean(pendingRotation?.user?.mustChangePassword ?? user?.mustChangePassword),
+      getBootstrapStatus,
+      bootstrapFirstAdmin,
+      rotatePassword,
       isAdmin: user?.role === 'admin',
       isSupervisor: user?.role === 'admin' || user?.role === 'supervisor',
       can,
@@ -533,7 +885,22 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       lastAuthError,
       updateUser,
     }),
-    [user, loading, lastAuthError, login, loginDetailed, logout, switchWarehouse, can, canAccessModule, updateUser]
+    [
+      user,
+      loading,
+      lastAuthError,
+      login,
+      loginDetailed,
+      logout,
+      switchWarehouse,
+      can,
+      canAccessModule,
+      updateUser,
+      pendingRotation,
+      getBootstrapStatus,
+      bootstrapFirstAdmin,
+      rotatePassword,
+    ]
   );
 
   return <AuthContext.Provider value={contextValue}>{children}</AuthContext.Provider>;

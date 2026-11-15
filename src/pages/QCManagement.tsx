@@ -1,7 +1,9 @@
 import { useState, useCallback, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { db, logAction } from '@/lib/db';
-import { dispositionQcHoldTransactional } from '@/lib/lifecycle';
+import { createQcHoldTransactional, dispositionQcHoldTransactional } from '@/lib/lifecycle';
+import { getStockScope, type StockScope } from '@/lib/stockBalances';
+import { getActiveWarehouseCode } from '@/lib/supabaseSync';
 import { useAuth } from '@/lib/auth';
 import BarcodeReader from '@/components/BarcodeReader';
 import StatusBadge from '@/components/StatusBadge';
@@ -51,15 +53,22 @@ export default function QCManagement() {
   const [quantity, setQuantity] = useState(1);
   const [reason, setReason] = useState('');
   const [lotNumber, setLotNumber] = useState('');
+  const [holdBin, setHoldBin] = useState('QC-HOLD-AREA');
+  const [scope, setScope] = useState<StockScope>({ tenantCode: '', warehouseCode: '' });
   const [scanMode, setScanMode] = useState(false);
   const [message, setMessage] = useState<{ type: 'success' | 'error' | 'warning'; text: string } | null>(null);
 
   const loadData = useCallback(async () => {
     setLoading(true);
     try {
+      // One warehouse at a time: holds and receipts from another site must never
+      // appear on this floor's inspection queue.
+      const active = await getStockScope(await getActiveWarehouseCode());
+      setScope(active);
+      const pair = [active.tenantCode, active.warehouseCode] as [string, string];
       const [holds, inbound] = await Promise.all([
-        db.qcHolds.toArray(),
-        db.inbound.reverse().limit(20).toArray(),
+        db.qcHolds.where('[tenantCode+warehouseCode]').equals(pair).toArray(),
+        db.inbound.where('[tenantCode+warehouseCode]').equals(pair).reverse().limit(20).toArray(),
       ]);
       setQcHolds(holds);
       setInboundRecords(inbound);
@@ -99,19 +108,24 @@ export default function QCManagement() {
     }
 
     try {
-      await db.qcHolds.add({
+      // A hold physically blocks the units it names: the lifecycle step moves
+      // them into a QUARANTINE dimension so FEFO can never allocate them.
+      const outcome = await createQcHoldTransactional({
         sku: sku.trim(),
         lotNumber: lotNumber.trim() || undefined,
         quantity,
         reason: reason.trim(),
-        status: 'hold',
+        bin: holdBin.trim() || undefined,
         operator: user?.displayName || 'Unknown',
-        createdAt: new Date().toISOString(),
+        operatorRole: user?.role,
       });
 
-      await logAction('QC_HOLD_CREATED', `QC Hold created: ${quantity}x ${sku} — ${reason.trim()}`, user?.displayName || 'Unknown');
-
-      showMessage('success', `QC Hold created for ${sku}`);
+      showMessage(
+        outcome.unmatchedQty > 0 ? 'warning' : 'success',
+        outcome.unmatchedQty > 0
+          ? `Hold raised at ${outcome.bin}: ${outcome.blockedQty}× ${sku.trim()} blocked, ${outcome.unmatchedQty} not found in that bin — verify the lot/bin and correct the balance.`
+          : `Hold raised at ${outcome.bin}: ${outcome.blockedQty}× ${sku.trim()} blocked from allocation`,
+      );
       setSku('');
       setQuantity(1);
       setReason('');
@@ -130,6 +144,7 @@ export default function QCManagement() {
         disposition: 'release',
         operator: user?.displayName || 'Supervisor',
         operatorRole: user?.role,
+        quarantineBin: (hold.location || holdBin).trim() || undefined,
       });
       showMessage(
         'success',
@@ -149,6 +164,7 @@ export default function QCManagement() {
         disposition: 'scrap',
         operator: user?.displayName || 'Supervisor',
         operatorRole: user?.role,
+        quarantineBin: (hold.location || holdBin).trim() || undefined,
       });
       showMessage('warning', `Scrapped ${hold.quantity}× ${hold.sku} (${hold.reason})`);
       loadData();
@@ -163,16 +179,22 @@ export default function QCManagement() {
       await db.inbound.update(record.id, { qcStatus: newStatus });
 
       if (newStatus === 'failed') {
-        // Auto-create a QC hold for failed inbound
-        await db.qcHolds.add({
+        // Auto-raise a blocking hold against the dock bin the receipt named.
+        const auto = await createQcHoldTransactional({
           sku: record.sku,
           lotNumber: record.lotNumber,
           quantity: record.qty,
           reason: 'Inbound QC Failed',
-          status: 'hold',
+          bin: record.bin?.trim() || 'RECV-DOCK-01',
           operator: user?.displayName || 'Unknown',
-          createdAt: new Date().toISOString(),
+          operatorRole: user?.role,
         });
+        if (auto.unmatchedQty > 0) {
+          showMessage(
+            'warning',
+            `QC failed: ${auto.blockedQty}× ${record.sku} blocked at ${auto.bin}; ${auto.unmatchedQty} were not in that bin`,
+          );
+        }
         await logAction('QC_INBOUND_FAILED', `Inbound QC failed for ${record.qty}x ${record.sku} — auto-placed on hold`, user?.displayName || 'Unknown');
         showMessage('warning', `QC Failed — ${record.qty}x ${record.sku} placed on hold`);
       } else {
@@ -290,16 +312,32 @@ export default function QCManagement() {
               />
             </div>
 
-            <div>
-              <label className="block text-[10px] text-text-secondary uppercase tracking-widest mb-1.5">Lot Number (Optional)</label>
-              <input
-                type="text"
-                value={lotNumber}
-                onChange={(e) => setLotNumber(e.target.value.toUpperCase())}
-                className="w-full bg-transparent border-b border-white/10 text-text-primary text-sm py-2 px-1 focus:outline-none focus:border-accent-sky transition-colors font-mono"
-                placeholder="LOT-XXXX"
-              />
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block text-[10px] text-text-secondary uppercase tracking-widest mb-1.5">Lot Number (Optional)</label>
+                <input
+                  type="text"
+                  value={lotNumber}
+                  onChange={(e) => setLotNumber(e.target.value.toUpperCase())}
+                  className="w-full bg-transparent border-b border-white/10 text-text-primary text-sm py-2 px-1 focus:outline-none focus:border-accent-sky transition-colors font-mono"
+                  placeholder="LOT-XXXX"
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] text-text-secondary uppercase tracking-widest mb-1.5">Quarantine bin</label>
+                <input
+                  type="text"
+                  value={holdBin}
+                  onChange={(e) => setHoldBin(e.target.value.toUpperCase())}
+                  className="w-full bg-transparent border-b border-white/10 text-text-primary text-sm py-2 px-1 focus:outline-none focus:border-accent-yellow transition-colors font-mono"
+                  placeholder="QC-HOLD-AREA"
+                />
+              </div>
             </div>
+            <p className="text-[10px] text-text-secondary/70 leading-relaxed">
+              Units found in that bin are moved to <span className="font-mono text-accent-yellow">QUARANTINE</span> and
+              removed from FEFO allocation immediately. Units not present there are reported, never assumed.
+            </p>
 
             <AnimatePresence>
               {message && (
@@ -336,6 +374,11 @@ export default function QCManagement() {
           <div className="flex items-center gap-2 mb-4">
             <AlertTriangle className="w-5 h-5 text-accent-yellow" />
             <h2 className="text-sm font-semibold text-text-primary">Active QC Holds</h2>
+            {scope.warehouseCode && (
+              <span className="text-[10px] font-mono bg-white/[0.06] text-text-secondary px-2 py-0.5 rounded-full">
+                {scope.warehouseCode} · {scope.tenantCode}
+              </span>
+            )}
             <span className="ml-auto text-[10px] text-text-secondary uppercase tracking-widest">
               {activeHoldList.length} item{activeHoldList.length !== 1 ? 's' : ''}
             </span>

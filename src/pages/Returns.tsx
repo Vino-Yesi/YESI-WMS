@@ -20,6 +20,10 @@ export default function Returns() {
   const [reason, setReason] = useState('Customer Cancelled');
   const [message, setMessage] = useState<{ type: 'success' | 'error' | 'warning'; text: string } | null>(null);
   const [scanMode, setScanMode] = useState(false);
+  // Returned units must be posted to a named bin + lot so the dimensional ledger
+  // keeps them apart from saleable stock.
+  const [returnBin, setReturnBin] = useState('RETURNS-DOCK');
+  const [returnLot, setReturnLot] = useState('');
 
   const handleScan = (code: string) => {
     setSku(code);
@@ -29,6 +33,10 @@ export default function Returns() {
   const handleProcessReturn = async () => {
     if (!sku.trim()) {
       setMessage({ type: 'error', text: 'Please scan a returning SKU' });
+      return;
+    }
+    if (!returnBin.trim()) {
+      setMessage({ type: 'error', text: 'A receiving bin is required so the return lands in a real stock dimension' });
       return;
     }
     if (quantity < 1) {
@@ -46,23 +54,28 @@ export default function Returns() {
         disposition: isDefective ? 'quarantine' : 'restock',
         operator: user?.displayName || 'Operator',
         operatorRole: user?.role || 'operator',
+        // Returned units must land in a named bin and lot, otherwise the
+        // dimensional ledger cannot tell them apart from saleable stock.
+        receivingBin: returnBin.trim() || undefined,
+        lotNumber: returnLot.trim() || undefined,
       });
 
       if (outcome.routedTo === 'qc_hold') {
         setMessage({
           type: 'warning',
-          text: `${outcome.rmaRef}: ${quantity}× ${sku} quarantined in QC Hold for supervisor disposition.`,
+          text: `${outcome.rmaRef}: ${quantity}× ${sku} quarantined at ${outcome.bin} for supervisor disposition.`,
         });
       } else {
         setMessage({
           type: 'success',
-          text: `${outcome.rmaRef}: ${quantity}× ${sku} staged into Directed Putaway Queue for verified bin restock.`,
+          text: `${outcome.rmaRef}: ${quantity}× ${sku} staged at ${outcome.bin} into the Directed Putaway Queue for verified bin restock.`,
         });
       }
 
       setSku('');
       setOrderId('');
       setQuantity(1);
+      setReturnLot('');
     } catch (err) {
       setMessage({ type: 'error', text: err instanceof Error ? err.message : 'Failed to process return' });
     }
@@ -141,6 +154,33 @@ export default function Returns() {
                 >
                   <Plus className="w-4 h-4" />
                 </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block text-[10px] text-text-secondary uppercase tracking-widest mb-1.5">
+                  Receiving bin
+                </label>
+                <input
+                  type="text"
+                  value={returnBin}
+                  onChange={(e) => setReturnBin(e.target.value.toUpperCase())}
+                  className="w-full bg-transparent border-b border-white/10 text-text-primary text-sm py-2 px-1 focus:outline-none focus:border-accent-sky transition-colors font-mono"
+                  placeholder="RETURNS-DOCK"
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] text-text-secondary uppercase tracking-widest mb-1.5">
+                  Lot (optional)
+                </label>
+                <input
+                  type="text"
+                  value={returnLot}
+                  onChange={(e) => setReturnLot(e.target.value.toUpperCase())}
+                  className="w-full bg-transparent border-b border-white/10 text-text-primary text-sm py-2 px-1 focus:outline-none focus:border-accent-sky transition-colors font-mono"
+                  placeholder="RMA lot"
+                />
               </div>
             </div>
 

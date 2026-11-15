@@ -1,142 +1,182 @@
-import { db, logAction, logInventoryMovement } from './db';
-import { enqueueCloudOperation } from './supabaseSync';
-import type { InventoryReservation, Order } from './db';
+/**
+ * YESI-WMS Offline FEFO Allocation Engine (v3)
+ *
+ * All-or-nothing, multi-bin, dimension-accurate reservation.
+ *
+ * Guarantees:
+ *  1. Stock is reserved from the EXACT bins/lots FEFO selects — an order that
+ *     needs 6 units split across three bins produces three reservations, each
+ *     pointing at the bin the picker must walk to.
+ *  2. Availability is computed per dimension as `on_hand - reserved -
+ *     quarantine - locally promised`, so two orders can never be promised the
+ *     same physical unit, and quarantine/damaged stock is never allocatable.
+ *  3. Expired lots are excluded from FEFO entirely (mirrors the server-side
+ *     `expiry_date >= CURRENT_DATE` guard).
+ *  4. If any line shortfalls, NOTHING is committed: the whole order stays
+ *     Pending and the conflict is reported with per-SKU detail.
+ *  5. Warehouse scoping is strict — a switch of active warehouse can never
+ *     reserve or consume another site's stock.
+ */
+
+import { db, logAction, type InventoryReservation, type Order } from './db';
+import { enqueueCloudOperation, getActiveWarehouseCode } from './supabaseSync';
+import {
+  allocatableDimensions,
+  commitAllocationPlan,
+  consumeReservationUnits,
+  getStockScope,
+  planFefoAllocation,
+  releaseReservationUnits,
+  skuAvailability,
+  verifyPickScan,
+  type AllocationLine,
+  type StockScope,
+} from './stockBalances';
 
 export type { InventoryReservation };
+export { allocatableDimensions, skuAvailability, verifyPickScan };
 
 export interface AllocationResult {
   success: boolean;
   reservations: InventoryReservation[];
   conflicts: string[];
   message: string;
+  /** Per-SKU FEFO plan, including shortfalls, for the picker UI. */
+  plan: AllocationLine[];
+  warehouseCode: string;
+}
+
+const TX_TABLES = () => [
+  db.stockBalances,
+  db.inventory,
+  db.inventoryReservations,
+  db.serialNumbers,
+  db.orders,
+  db.auditLogs,
+  db.inventoryMovements,
+];
+
+function countLines(requiredSkus: string): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const raw of String(requiredSkus ?? '').split(',')) {
+    const sku = raw.trim();
+    if (!sku) continue;
+    // `SKU*3` and `SKU:3` are accepted explicit quantity notations.
+    const m = sku.match(/^(.*?)[*x:](\d+)$/i);
+    if (m && m[1]) {
+      counts[m[1].trim()] = (counts[m[1].trim()] || 0) + Number(m[2]);
+    } else {
+      counts[sku] = (counts[sku] || 0) + 1;
+    }
+  }
+  return counts;
 }
 
 /**
- * Atomic Transactional FEFO Allocation
+ * Atomic transactional FEFO allocation across every bin that holds the SKU.
  *
- * Wraps multi-SKU reservation & serial locking inside a single Dexie `rw` transaction.
- * If ANY SKU line in the order lacks sufficient unreserved available stock, zero partial
- * reservations are committed (all-or-nothing atomicity).
+ * Wraps multi-SKU reservation inside a single Dexie `rw` transaction. If ANY
+ * line lacks sufficient unreserved available stock, zero partial reservations
+ * are committed (all-or-nothing atomicity).
  */
-export async function allocateOrder(
-  order: Order,
-  operator: string
-): Promise<AllocationResult> {
-  const skus = order.requiredSkus.split(',').map((s) => s.trim()).filter(Boolean);
-  const counts: Record<string, number> = {};
-  for (const sku of skus) counts[sku] = (counts[sku] || 0) + 1;
+export async function allocateOrder(order: Order, operator: string, explicitWarehouse?: string): Promise<AllocationResult> {
+  const scope: StockScope = {
+    tenantCode: (order.tenantCode ?? '').trim().toUpperCase() || (await getStockScope()).tenantCode,
+    warehouseCode:
+      explicitWarehouse?.trim().toUpperCase() ||
+      (order.warehouseCode ?? '').trim().toUpperCase() ||
+      (await getActiveWarehouseCode()),
+  };
 
-  const reservations: InventoryReservation[] = [];
+  const counts = countLines(order.requiredSkus);
+  const plan: AllocationLine[] = [];
   const conflicts: string[] = [];
-  const now = new Date();
-  const expiresAt = new Date(now.getTime() + 4 * 3_600_000).toISOString();
+  const reservations: InventoryReservation[] = [];
 
-  await db.transaction(
-    'rw',
-    [db.inventory, db.inventoryReservations, db.serialNumbers, db.orders],
-    async () => {
-      // Phase 1: Validate all lines before mutating
-      const stagedLines: Array<{
-        sku: string;
-        qty: number;
-        lotNumber?: string;
-        fefoPriority: number;
-        serialIds: number[];
-        serialCodes: string[];
-      }> = [];
+  if (Object.keys(counts).length === 0) {
+    return {
+      success: false,
+      reservations,
+      conflicts: ['Order has no SKU lines'],
+      message: 'Allocation failed: order has no SKU lines',
+      plan,
+      warehouseCode: scope.warehouseCode,
+    };
+  }
 
-      for (const [sku, qty] of Object.entries(counts)) {
-        const items = await db.inventory.where('sku').equals(sku).toArray();
-        const item = items[0];
-        if (!item) {
-          conflicts.push(`${sku}: SKU not found`);
-          continue;
+  await db.transaction('rw', TX_TABLES(), async () => {
+    // Phase 1 — plan every line before mutating anything.
+    for (const [sku, qty] of Object.entries(counts)) {
+      const line = await planFefoAllocation(sku, qty, scope, order.orderId);
+      plan.push(line);
+
+      if (line.shortfall > 0) {
+        const avail = await skuAvailability(sku, scope, order.orderId);
+        const dims = await allocatableDimensions(sku, scope, order.orderId);
+        if (dims.length === 0 && avail.onHand > 0) {
+          conflicts.push(
+            `${sku}: ${avail.onHand} on hand but none allocatable (reserved ${avail.reserved}, quarantine ${avail.quarantine}, or lot expired)`,
+          );
+        } else {
+          conflicts.push(
+            `${sku}: need ${qty}, only ${avail.available} available across ${dims.length} bin(s) [${dims
+              .map((d) => `${d.location}/${d.lotNumber}=${d.available}`)
+              .join(', ') || 'no bins'}]`,
+          );
         }
-
-        const existingReserved = await db.inventoryReservations
-          .where('sku')
-          .equals(sku)
-          .filter((r) => r.status === 'reserved' || r.status === 'allocated')
-          .toArray();
-        const reservedQty = existingReserved.reduce((s, r) => s + r.quantity, 0);
-        const available = (item.stock || 0) - reservedQty;
-
-        if (available < qty) {
-          conflicts.push(`${sku}: need ${qty}, only ${available} available (${reservedQty} reserved)`);
-          continue;
-        }
-
-        const serials = (
-          await db.serialNumbers
-            .where('sku')
-            .equals(sku)
-            .filter((s) => s.status === 'in_stock')
-            .toArray()
-        ).sort((a, b) => (a.expiryDate || '').localeCompare(b.expiryDate || ''));
-
-        const selected = item.serializable || serials.length > 0 ? serials.slice(0, qty) : [];
-        stagedLines.push({
-          sku,
-          qty,
-          lotNumber: item.lotNumber,
-          fefoPriority: item.fefoPriority || 99,
-          serialIds: selected.map((s) => s.id!).filter(Boolean),
-          serialCodes: selected.map((s) => s.serialNumber),
-        });
       }
+    }
 
-      if (conflicts.length > 0) {
-        return;
-      }
+    if (conflicts.length > 0) {
+      await db.auditLogs.add({
+        action: 'ALLOCATION_CONFLICT',
+        details: `FEFO allocation shortfall for ${order.orderId}: ${conflicts.join('; ')}`,
+        operator,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
 
-      // Phase 2: Commit reservations + serial locks + order status atomically
-      for (const line of stagedLines) {
-        const reservation: InventoryReservation = {
-          reservationId: `RES-${order.orderId}-${line.sku}-${Date.now()}`,
+    // Phase 2 — commit reservations dimension by dimension.
+    for (const line of plan) {
+      const created = await commitAllocationPlan(line, { orderId: order.orderId, operator, scope });
+      for (const c of created) {
+        reservations.push({
+          reservationId: c.reservationId,
           orderId: order.orderId,
           sku: line.sku,
-          quantity: line.qty,
-          lotNumber: line.lotNumber,
-          serialNumbers: line.serialCodes.length > 0 ? line.serialCodes.join(',') : undefined,
-          status: 'reserved',
-          fefoPriority: line.fefoPriority,
-          reservedAt: now.toISOString(),
-          expiresAt,
+          quantity: c.qty,
+          location: c.location,
+          lotNumber: c.lotNumber,
+          status: 'allocated',
+          fefoPriority: 0,
+          reservedAt: new Date().toISOString(),
+          expiresAt: new Date(Date.now() + 4 * 3_600_000).toISOString(),
           operator,
-        };
-
-        for (const sid of line.serialIds) {
-          await db.serialNumbers.update(sid, {
-            status: 'reserved',
-            orderId: order.orderId,
-            updatedAt: now.toISOString(),
-          });
-        }
-
-        await db.inventoryReservations.add(reservation);
-        reservations.push(reservation);
-      }
-
-      if (order.id != null && order.status === 'Pending') {
-        await db.orders.update(order.id, {
-          status: 'Picking',
-          updatedAt: now.toISOString(),
+          tenantCode: scope.tenantCode,
+          warehouseCode: scope.warehouseCode,
         });
       }
     }
-  );
+
+    if (order.id != null && order.status === 'Pending') {
+      await db.orders.update(order.id, { status: 'Picking', updatedAt: new Date().toISOString() });
+    }
+  });
 
   const success = conflicts.length === 0;
   if (success) {
     await logAction(
       'ALLOCATE_ORDER',
-      `Reserved inventory for ${order.orderId}: ${reservations.map((r) => `${r.sku}×${r.quantity}`).join(', ')}`,
-      operator
+      `Reserved inventory for ${order.orderId} in ${scope.warehouseCode}: ${reservations
+        .map((r) => `${r.quantity}× ${r.sku} @ ${r.location}/${r.lotNumber}`)
+        .join(', ')}`,
+      operator,
     );
     void enqueueCloudOperation(
       'allocate_order',
-      { orderId: order.orderId, operator },
-      `alloc:${order.orderId}`
+      { orderId: order.orderId, operator, tenantCode: scope.tenantCode, warehouseCode: scope.warehouseCode },
+      `alloc:${scope.warehouseCode}:${order.orderId}`,
     );
   }
 
@@ -144,15 +184,101 @@ export async function allocateOrder(
     success,
     reservations,
     conflicts,
+    plan,
+    warehouseCode: scope.warehouseCode,
     message: success
-      ? `Allocated ${reservations.length} SKU lines for ${order.orderId}`
+      ? `Allocated ${reservations.length} bin line(s) for ${order.orderId} in ${scope.warehouseCode}`
       : `Allocation failed: ${conflicts.join('; ')}`,
   };
 }
 
+/**
+ * Scan-verified pick confirmation.
+ *
+ * The scanned code MUST match the reserved dimension (serial, SKU barcode or
+ * lot label). A mismatch throws `PICK_SCAN_MISMATCH` and consumes nothing, so a
+ * wrong-bin grab can never be recorded as a completed pick.
+ */
+export async function confirmPickWithScan(params: {
+  reservationId: string;
+  scannedCode: string;
+  pickedQty?: number;
+  operator: string;
+}): Promise<{ ok: true; consumed: number; location: string; lotNumber: string; matched: 'serial' | 'barcode' | 'lot' } | { ok: false; code: string; error: string }> {
+  const scope = await getStockScope();
+  const reservation = await db.inventoryReservations.where('reservationId').equals(params.reservationId).first();
+  if (!reservation) return { ok: false, code: 'RESERVATION_NOT_FOUND', error: `Unknown reservation ${params.reservationId}` };
+  if (reservation.status === 'picked' || reservation.status === 'released') {
+    return { ok: false, code: 'ALREADY_CONFIRMED', error: `Reservation ${params.reservationId} is already ${reservation.status}` };
+  }
+
+  const scan = await verifyPickScan({
+    sku: reservation.sku,
+    scannedCode: params.scannedCode,
+    location: reservation.location,
+    lotNumber: reservation.lotNumber,
+    scope: { tenantCode: reservation.tenantCode ?? scope.tenantCode, warehouseCode: reservation.warehouseCode ?? scope.warehouseCode },
+  });
+  if (!scan.ok) {
+    await db.auditLogs
+      .add({
+        action: 'PICK_SCAN_MISMATCH',
+        details: `${params.operator} scanned "${params.scannedCode}" against ${reservation.sku} @ ${reservation.location ?? 'unscoped'}: ${scan.error}`,
+        operator: params.operator,
+        timestamp: new Date().toISOString(),
+      })
+      .catch(() => {});
+    return scan;
+  }
+
+  let result: { consumed: number; location: string; lotNumber: string } | null = null;
+  let failure: { code: string; error: string } | null = null;
+
+  await db.transaction('rw', TX_TABLES(), async () => {
+    try {
+      result = await consumeReservationUnits(reservation, {
+        operator: params.operator,
+        qty: params.pickedQty,
+        movementType: 'pick',
+        note: `Scan-verified pick (${scan.matched}: ${params.scannedCode})`,
+        scope,
+      });
+    } catch (err) {
+      failure = { code: 'CONSUME_FAILED', error: err instanceof Error ? err.message : String(err) };
+      throw err; // rolls the Dexie transaction back
+    }
+  });
+
+  if (failure || !result) return failure ?? { ok: false, code: 'CONSUME_FAILED', error: 'Pick could not be committed' };
+  const consumed = result as { consumed: number; location: string; lotNumber: string };
+
+  await logAction(
+    'PICK_CONFIRMED',
+    `${consumed.consumed}× ${reservation.sku} picked from ${consumed.location}/${consumed.lotNumber} for ${reservation.orderId} (scan ${scan.matched})`,
+    params.operator,
+  );
+  void enqueueCloudOperation(
+    'confirm_pick',
+    {
+      taskNumber: params.reservationId,
+      scannedCode: params.scannedCode,
+      pickedQty: consumed.consumed,
+      operator: params.operator,
+      orderId: reservation.orderId,
+      tenantCode: scope.tenantCode,
+      warehouseCode: scope.warehouseCode,
+    },
+    `pick:${scope.warehouseCode}:${params.reservationId}:${params.scannedCode}`,
+  ).catch(() => {});
+
+  return { ok: true, ...consumed, matched: scan.matched };
+}
+
 export async function releaseReservation(reservationId: string, operator: string): Promise<boolean> {
+  const scope = await getStockScope();
   let released = false;
-  await db.transaction('rw', [db.inventoryReservations, db.serialNumbers], async () => {
+
+  await db.transaction('rw', TX_TABLES(), async () => {
     const res = await db.inventoryReservations.where('reservationId').equals(reservationId).first();
     if (!res || res.status === 'picked' || res.status === 'released') return;
 
@@ -169,31 +295,28 @@ export async function releaseReservation(reservationId: string, operator: string
       }
     }
 
-    await db.inventoryReservations.update(res.id!, { status: 'released' });
-    released = true;
+    released = await releaseReservationUnits(res, scope);
   });
 
-  if (released) {
-    await logAction('RELEASE_RESERVATION', `Released ${reservationId}`, operator);
-  }
+  if (released) await logAction('RELEASE_RESERVATION', `Released ${reservationId}`, operator);
   return released;
 }
 
+/** Fulfils (ships out) a reservation against its exact reserved dimension. */
 export async function fulfillReservation(reservationId: string, operator: string): Promise<boolean> {
-  let snap: { sku: string; qty: number; orderId: string; lotNumber?: string } | null = null;
+  const scope = await getStockScope();
+  let done = false;
 
-  await db.transaction('rw', [db.inventoryReservations, db.inventory, db.serialNumbers], async () => {
+  await db.transaction('rw', TX_TABLES(), async () => {
     const res = await db.inventoryReservations.where('reservationId').equals(reservationId).first();
-    if (!res || res.status !== 'reserved') return;
+    if (!res || (res.status !== 'reserved' && res.status !== 'allocated')) return;
 
-    const item = await db.inventory.where('sku').equals(res.sku).first();
-    if (!item || (item.stock || 0) < res.quantity) return;
-
-    await db.inventory.update(item.id!, {
-      stock: (item.stock || 0) - res.quantity,
-      updatedAt: new Date().toISOString(),
+    await consumeReservationUnits(res, {
+      operator,
+      movementType: 'pick',
+      note: `FEFO allocation ${reservationId}`,
+      scope,
     });
-    await db.inventoryReservations.update(res.id!, { status: 'picked' });
 
     if (res.serialNumbers) {
       for (const sn of res.serialNumbers.split(',')) {
@@ -208,25 +331,20 @@ export async function fulfillReservation(reservationId: string, operator: string
         }
       }
     }
-
-    snap = { sku: res.sku, qty: res.quantity, orderId: res.orderId, lotNumber: res.lotNumber };
+    done = true;
   });
 
-  if (!snap) return false;
-  const s = snap as { sku: string; qty: number; orderId: string; lotNumber?: string };
-  await logInventoryMovement(s.sku, 'pick', s.qty, operator, {
-    orderId: s.orderId,
-    lotNumber: s.lotNumber,
-    note: `FEFO allocation ${reservationId}`,
-  });
-  return true;
+  return done;
 }
 
-export async function getAllocationSummary() {
-  const [reservations, orders, inventory] = await Promise.all([
-    db.inventoryReservations.toArray(),
-    db.orders.where('status').equals('Pending').toArray(),
-    db.inventory.toArray(),
+/** Active reservations for one warehouse, grouped by SKU. */
+export async function getAllocationSummary(explicitWarehouse?: string) {
+  const scope = await getStockScope(explicitWarehouse);
+
+  const [reservations, orders, balances] = await Promise.all([
+    db.inventoryReservations.where('[tenantCode+warehouseCode]').equals([scope.tenantCode, scope.warehouseCode]).toArray(),
+    db.orders.where('[tenantCode+warehouseCode+status]').equals([scope.tenantCode, scope.warehouseCode, 'Pending']).toArray(),
+    db.stockBalances.where('[tenantCode+warehouseCode]').equals([scope.tenantCode, scope.warehouseCode]).toArray(),
   ]);
 
   const active = reservations.filter((r) => r.status === 'reserved' || r.status === 'allocated');
@@ -236,55 +354,88 @@ export async function getAllocationSummary() {
   const allocatedOrderIds = new Set(active.map((r) => r.orderId));
   const pendingAllocations = orders.filter((o) => !allocatedOrderIds.has(o.orderId)).length;
 
-  const invMap = new Map(inventory.map((i) => [i.sku, i]));
-  const conflicts = orders.filter((o) => {
-    const skus = o.requiredSkus.split(',').map((s) => s.trim());
-    return skus.some((sku) => {
-      const item = invMap.get(sku);
-      const reserved = reservedBySku[sku] || 0;
-      return !item || (item.stock || 0) - reserved < skus.filter((s) => s === sku).length;
-    });
-  }).length;
+  const onHandBySku = new Map<string, number>();
+  const availableBySku = new Map<string, number>();
+  const binsBySku = new Map<string, Set<string>>();
+  const expiryBySku = new Map<string, string>();
+  for (const b of balances) {
+    onHandBySku.set(b.sku, (onHandBySku.get(b.sku) ?? 0) + b.onHandQty);
+    if (b.stockStatus === 'AVAILABLE') {
+      availableBySku.set(b.sku, (availableBySku.get(b.sku) ?? 0) + Math.max(0, b.onHandQty - b.reservedQty - b.quarantineQty));
+      binsBySku.set(b.sku, (binsBySku.get(b.sku) ?? new Set<string>()).add(b.location));
+      if (b.expiryDate) {
+        const prev = expiryBySku.get(b.sku);
+        if (!prev || b.expiryDate < prev) expiryBySku.set(b.sku, b.expiryDate);
+      }
+    }
+  }
+
+  let conflicts = 0;
+  for (const o of orders) {
+    for (const [sku, needed] of Object.entries(countLines(o.requiredSkus))) {
+      const free = (availableBySku.get(sku) ?? 0) - (reservedBySku[sku] ?? 0);
+      if (free < needed) {
+        conflicts++;
+        break;
+      }
+    }
+  }
 
   const topReserved = Object.entries(reservedBySku)
-    .map(([sku, reserved]) => {
-      const item = invMap.get(sku);
-      return { sku, reserved, available: (item?.stock || 0) - reserved };
-    })
+    .map(([sku, reserved]) => ({
+      sku,
+      reserved,
+      available: Math.max(0, (availableBySku.get(sku) ?? 0) - reserved),
+      bins: binsBySku.get(sku)?.size ?? 0,
+    }))
     .sort((a, b) => b.reserved - a.reserved)
     .slice(0, 5);
 
   return {
+    warehouseCode: scope.warehouseCode,
     activeReservations: active.length,
     totalReservations: active.length,
     totalReservedUnits: active.reduce((s, r) => s + r.quantity, 0),
     pendingAllocations,
     conflicts,
-    fefoEligible: inventory.filter((i) => i.expiryDate || i.fefoPriority).length,
+    multiBinSkus: Array.from(binsBySku.entries()).filter(([, bins]) => bins.size > 1).length,
+    fefoEligible: expiryBySku.size,
+    earliestExpiry: Array.from(expiryBySku.values()).sort()[0] ?? null,
     topReserved,
   };
 }
 
-export async function autoAllocatePendingOrders(operator: string): Promise<{ allocated: number; failed: number }> {
-  const orders = await db.orders.where('status').equals('Pending').toArray();
-  const existing = await db.inventoryReservations.toArray();
-  const allocatedIds = new Set(existing.map((r) => r.orderId));
+export async function autoAllocatePendingOrders(operator: string, explicitWarehouse?: string): Promise<{ allocated: number; failed: number; conflicts: string[] }> {
+  const scope = await getStockScope(explicitWarehouse);
+  const orders = await db.orders
+    .where('[tenantCode+warehouseCode+status]')
+    .equals([scope.tenantCode, scope.warehouseCode, 'Pending'])
+    .toArray();
+  const existing = await db.inventoryReservations
+    .where('[tenantCode+warehouseCode]')
+    .equals([scope.tenantCode, scope.warehouseCode])
+    .toArray();
+  const allocatedIds = new Set(existing.filter((r) => r.status === 'reserved' || r.status === 'allocated').map((r) => r.orderId));
 
   let allocated = 0;
   let failed = 0;
+  const conflicts: string[] = [];
 
   const sorted = [...orders]
     .filter((o) => !allocatedIds.has(o.orderId))
     .sort((a, b) => {
-      const prio = { urgent: 0, high: 1, normal: 2 };
-      return prio[a.priority] - prio[b.priority];
+      const prio = { urgent: 0, high: 1, normal: 2 } as Record<string, number>;
+      return (prio[a.priority] ?? 2) - (prio[b.priority] ?? 2) || a.createdAt.localeCompare(b.createdAt);
     });
 
   for (const order of sorted) {
-    const result = await allocateOrder(order, operator);
+    const result = await allocateOrder(order, operator, scope.warehouseCode);
     if (result.success) allocated++;
-    else failed++;
+    else {
+      failed++;
+      conflicts.push(...result.conflicts.map((c) => `${order.orderId}: ${c}`));
+    }
   }
 
-  return { allocated, failed };
+  return { allocated, failed, conflicts };
 }
