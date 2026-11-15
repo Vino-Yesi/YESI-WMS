@@ -1,9 +1,20 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { db, logAction, type IntegrationEndpoint } from '@/lib/db';
+import { db, logAction, type IntegrationEndpoint, type OutboxEvent } from '@/lib/db';
 import { useAuth } from '@/lib/auth';
 import { useAppStore } from '@/lib/store';
 import { runSheetSync } from '@/lib/ozonSheetSync';
+import {
+  drainLocalOutbox,
+  flushTelemetry,
+  getDeadLetterOutbox,
+  getOutboxCounts,
+  getSyncState,
+  pullCloudSnapshotToEdge,
+  retryDeadLetterEvent,
+  discardDeadLetterEvent,
+} from '@/lib/supabaseSync';
+import { isSupabaseConfigured, flushCloudOutbox } from '@/lib/supabase';
 import {
   Plug, Server, Cloud, CloudCog, RefreshCw, AlertTriangle,
   CheckCircle, XCircle, Globe, ShoppingCart, Truck, Database,
@@ -69,11 +80,11 @@ const STATUS_STYLES: Record<EndpointStatus, { dot: string; bg: string; text: str
 };
 
 const SYNC_STEPS: SyncStep[] = [
-  { label: 'Connecting', detail: 'Establishing secure connection…', durationMs: 800 },
-  { label: 'Fetching Orders', detail: 'Pulling new order data…', durationMs: 1200 },
-  { label: 'Updating Inventory', detail: 'Syncing stock levels…', durationMs: 1000 },
-  { label: 'Shipping Labels', detail: 'Syncing carrier labels…', durationMs: 900 },
-  { label: 'Finalizing', detail: 'Committing changes…', durationMs: 700 },
+  { label: 'Connecting', detail: 'Validating tenant + warehouse scope…', durationMs: 800 },
+  { label: 'Pushing Queue', detail: 'Draining the transactional outbox…', durationMs: 1200 },
+  { label: 'Pulling Snapshot', detail: 'Reconciling cloud balances, orders and tasks…', durationMs: 1000 },
+  { label: 'Flushing Gateway', detail: 'Delivering leased outbox events to subscribers…', durationMs: 900 },
+  { label: 'Finalizing', detail: 'Recording telemetry and audit trail…', durationMs: 700 },
 ];
 
 /* ─── Component ────────────────────────────────────────────── */
@@ -94,6 +105,11 @@ export default function IntegrationHub() {
   const [showSync, setShowSync] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
   const [selected, setSelected] = useState<IntegrationEndpoint | null>(null);
+
+  /* Transactional outbox / dead-letter queue (real, not simulated) */
+  const [dlq, setDlq] = useState<OutboxEvent[]>([]);
+  const [outboxCounts, setOutboxCounts] = useState({ pending: 0, processing: 0, failed: 0, deadLetter: 0 });
+  const [endpointLogs, setEndpointLogs] = useState<Array<{ action: string; details: string; operator: string; timestamp: string }>>([]);
 
   /* Sync simulator */
   const [syncStep, setSyncStep] = useState(0);
@@ -126,6 +142,23 @@ export default function IntegrationHub() {
       return e;
     });
     setEndpoints(enriched);
+
+    // Real queue depth + quarantined commands, read from the indexed outbox.
+    try {
+      const [counts, dead] = await Promise.all([getOutboxCounts(), getDeadLetterOutbox()]);
+      setOutboxCounts(counts);
+      setDlq(dead.slice(0, 25));
+      const logs = await db.auditLogs
+        .where('action')
+        .anyOf(['INTEGRATION_SYNC', 'INTEGRATION_ADD', 'INTEGRATION_EDIT', 'INTEGRATION_TOGGLE', 'INTEGRATION_DELETE', 'OUTBOX_DEAD_LETTERED', 'OUTBOX_EVENT_DISCARDED', 'INTEGRATION_RETRY', 'INTEGRATION_CLEAR_ERRORS'])
+        .reverse()
+        .limit(40)
+        .toArray();
+      setEndpointLogs(logs);
+    } catch {
+      // IndexedDB unavailable — the panels simply stay empty.
+    }
+
     setRefreshing(false);
     setLoading(false);
   }, []);
@@ -136,7 +169,9 @@ export default function IntegrationHub() {
   const total = endpoints.length;
   const active = endpoints.filter(e => e.status === 'active').length;
   const errors = endpoints.filter(e => e.status === 'error').length;
-  const recordsToday = endpoints.reduce((s, e) => s + (e.recordsSynced || 0), 0);
+  // Lifetime per-endpoint totals: nothing here is scoped to today, so it must
+  // not be presented as a daily figure.
+  const recordsAllTime = endpoints.reduce((s, e) => s + (e.recordsSynced || 0), 0);
   const nextSync = endpoints
     .filter(e => e.status === 'active' && e.nextSync)
     .sort((a, b) => new Date(a.nextSync!).getTime() - new Date(b.nextSync!).getTime())[0]?.nextSync;
@@ -259,8 +294,42 @@ export default function IntegrationHub() {
       return;
     }
 
-    let recordsAdded = Math.floor(Math.random() * 50 + 10);
-    let syncDetail = `${recordsAdded} records`;
+    // Real work, real numbers. The progress animation above is cosmetic; the
+    // counts reported here come from the transactional outbox, the cloud
+    // snapshot and the gateway flush — never from Math.random().
+    let recordsAdded = 0;
+    const syncParts: string[] = [];
+
+    if (!isSupabaseConfigured) {
+      syncParts.push('offline edge mode (no cloud scope configured)');
+    } else {
+      const drained = await drainLocalOutbox();
+      recordsAdded += drained.processed;
+      syncParts.push(`${drained.processed} queued command(s) pushed, ${drained.remaining} still pending`);
+
+      const pulled = await pullCloudSnapshotToEdge();
+      if (pulled) {
+        const sync = getSyncState();
+        syncParts.push(`snapshot reconciled in ${sync.cloudLatencyMs ?? 0}ms`);
+        const counts = await getOutboxCounts();
+        recordsAdded += counts.pending;
+      } else {
+        syncParts.push('snapshot pull skipped (offline or already running)');
+      }
+
+      const flushed = await flushCloudOutbox();
+      if (flushed.ok) {
+        recordsAdded += flushed.published_count;
+        syncParts.push(`${flushed.published_count} event(s) delivered by the edge gateway`);
+      } else if (flushed.error) {
+        syncParts.push(`gateway flush refused: ${flushed.error}`);
+      }
+
+      const telemetryFlushed = await flushTelemetry();
+      if (telemetryFlushed > 0) syncParts.push(`${telemetryFlushed} telemetry sample(s) reported`);
+    }
+
+    let syncDetail = syncParts.join(' · ') || `${recordsAdded} records`;
 
     if (ep.provider === 'Ozon' || ep.name.toLowerCase().includes('ozon')) {
       setSyncMessage('Pulling Ozon orders from Google Sheets…');
@@ -300,7 +369,11 @@ export default function IntegrationHub() {
     });
     await logAction('INTEGRATION_SYNC', `Synced ${ep.name} — ${syncDetail}`, operator);
     setSyncComplete(true);
-    setSyncMessage(`Sync complete! ${recordsAdded} records processed.`);
+    setSyncMessage(
+      recordsAdded > 0
+        ? `Sync complete — ${recordsAdded} record(s). ${syncDetail}.`
+        : `Sync complete — nothing to transfer. ${syncDetail}.`,
+    );
     load();
   };
 
@@ -346,7 +419,7 @@ export default function IntegrationHub() {
   /* ─── Flow Visualizer Data ──────────────────────────────── */
   const flowNodes: FlowNode[] = [
     { id: 'erp', label: 'ERP', icon: Database, count: endpoints.filter(e => e.type === 'erp').reduce((s, e) => s + e.recordsSynced, 0), color: 'text-accent-sky' },
-    { id: 'wms', label: 'WMS', icon: Server, count: recordsToday, color: 'text-accent-green' },
+    { id: 'wms', label: 'WMS', icon: Server, count: recordsAllTime, color: 'text-accent-green' },
     { id: 'oms', label: 'OMS', icon: ShoppingCart, count: endpoints.filter(e => e.type === 'oms').reduce((s, e) => s + e.recordsSynced, 0), color: 'text-accent-yellow' },
     { id: 'tms', label: 'TMS', icon: Truck, count: endpoints.filter(e => e.type === 'tms').reduce((s, e) => s + e.recordsSynced, 0), color: 'text-accent-sky' },
     { id: 'customer', label: 'Customer', icon: Globe, count: 0, color: 'text-text-primary' },
@@ -403,7 +476,15 @@ export default function IntegrationHub() {
           { label: 'Total Integrations', value: total, icon: Plug, color: 'text-text-primary', delay: 0 },
           { label: 'Active Connections', value: active, icon: Wifi, color: 'text-accent-green', delay: 0.05 },
           { label: 'Sync Errors', value: errors, icon: AlertTriangle, color: 'text-accent-red', alert: errors > 0, delay: 0.1 },
-          { label: 'Records Synced', value: recordsToday.toLocaleString(), icon: Database, color: 'text-accent-sky', delay: 0.15 },
+          { label: 'Records Synced (all time)', value: recordsAllTime.toLocaleString(), icon: Database, color: 'text-accent-sky', delay: 0.15 },
+          {
+            label: 'Queued / Dead-Letter',
+            value: `${outboxCounts.pending + outboxCounts.processing} / ${outboxCounts.deadLetter}`,
+            icon: Layers,
+            color: outboxCounts.deadLetter > 0 ? 'text-accent-red' : 'text-accent-sky',
+            alert: outboxCounts.deadLetter > 0,
+            delay: 0.17,
+          },
           { label: 'Next Sync', value: nextSync ? new Date(nextSync).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—', icon: Clock, color: 'text-accent-yellow', delay: 0.2 },
         ].map((kpi) => (
           <motion.div
@@ -615,6 +696,120 @@ export default function IntegrationHub() {
                 );
               })}
             </AnimatePresence>
+          </div>
+        )}
+      </motion.div>
+
+      {/* Transactional Outbox / Dead-Letter Queue */}
+      <motion.div
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.3, duration: 0.3 }}
+        className="glass-panel rounded-lg p-5"
+      >
+        <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center gap-2">
+            <Layers className="w-4 h-4 text-accent-sky" />
+            <h3 className="text-sm font-semibold text-text-primary">Transactional Outbox</h3>
+            <span className="text-[10px] bg-white/[0.06] text-text-secondary px-2 py-0.5 rounded-full font-mono">
+              {outboxCounts.pending} pending · {outboxCounts.processing} leased
+            </span>
+            {outboxCounts.deadLetter > 0 && (
+              <span className="text-[10px] bg-accent-red/20 text-accent-red px-2 py-0.5 rounded-full">
+                {outboxCounts.deadLetter} dead-letter
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={async () => {
+                const result = await drainLocalOutbox();
+                addNotification({
+                  title: 'Outbox drain',
+                  message: result.skippedLock
+                    ? 'Another tab is already draining the queue.'
+                    : `${result.processed} command(s) pushed, ${result.remaining} still pending.`,
+                  type: result.skippedLock ? 'warning' : 'success',
+                });
+                load();
+              }}
+              disabled={!isSupabaseConfigured}
+              className="flex items-center gap-1 px-2.5 py-1.5 rounded-md bg-white/[0.04] hover:bg-white/[0.08] text-text-secondary hover:text-text-primary text-[10px] transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+              title={isSupabaseConfigured ? 'Drain the local outbox to the cloud now' : 'Cloud scope not configured'}
+            >
+              <Play className="w-3 h-3" />
+              Drain now
+            </button>
+          </div>
+        </div>
+
+        {!isSupabaseConfigured && (
+          <p className="text-[11px] text-text-secondary bg-white/[0.02] border border-white/[0.05] rounded-md px-3 py-2 mb-3">
+            Offline-Edge mode: commands accumulate locally and replay with their idempotency keys as soon as a cloud
+            scope (<span className="font-mono">VITE_SUPABASE_URL</span> +{' '}
+            <span className="font-mono">VITE_SUPABASE_ANON_KEY</span>) is configured.
+          </p>
+        )}
+
+        {dlq.length === 0 ? (
+          <p className="text-xs text-text-secondary text-center py-4">
+            No quarantined commands. Every lifecycle event either published or is still retrying.
+          </p>
+        ) : (
+          <div className="space-y-2 max-h-[280px] overflow-y-auto pr-1">
+            {dlq.map((ev) => (
+              <div
+                key={ev.eventId}
+                className="flex items-start gap-3 p-2.5 bg-accent-red/5 rounded-md border border-accent-red/10"
+              >
+                <XCircle className="w-3.5 h-3.5 text-accent-red shrink-0 mt-0.5" />
+                <div className="flex-1 min-w-0">
+                  <p className="text-xs text-text-primary font-mono truncate">
+                    {ev.command} <span className="text-text-secondary">· {ev.warehouseCode}</span>
+                  </p>
+                  <p className="text-[10px] text-text-secondary truncate" title={ev.lastError || ''}>
+                    {ev.lastError || 'No error recorded'}
+                  </p>
+                  <p className="text-[9px] text-text-secondary/70 font-mono mt-0.5">
+                    key {ev.idempotencyKey.slice(0, 42)} · {ev.retryCount} attempt(s) ·{' '}
+                    {new Date(ev.createdAt).toLocaleString()}
+                  </p>
+                </div>
+                <div className="flex items-center gap-1 shrink-0">
+                  <button
+                    onClick={async () => {
+                      const ok = await retryDeadLetterEvent(ev.eventId);
+                      addNotification({
+                        title: ok ? 'Re-queued' : 'Retry refused',
+                        message: ok ? `${ev.command} is pending again and will replay with the same idempotency key.` : 'Event not found.',
+                        type: ok ? 'success' : 'error',
+                      });
+                      load();
+                    }}
+                    className="p-1.5 rounded-md bg-white/[0.04] hover:bg-accent-sky/10 text-text-secondary hover:text-accent-sky transition-all"
+                    title="Re-queue for another attempt"
+                  >
+                    <RefreshCw className="w-3 h-3" />
+                  </button>
+                  <button
+                    onClick={async () => {
+                      if (!confirm(`Discard ${ev.command} ${ev.idempotencyKey}? This is audited and cannot be undone.`)) return;
+                      const ok = await discardDeadLetterEvent(ev.eventId);
+                      addNotification({
+                        title: ok ? 'Discarded' : 'Discard refused',
+                        message: ok ? 'The event was removed and the discard was written to the audit log.' : 'Only dead-lettered events can be discarded.',
+                        type: ok ? 'success' : 'error',
+                      });
+                      load();
+                    }}
+                    className="p-1.5 rounded-md bg-white/[0.04] hover:bg-accent-red/10 text-text-secondary hover:text-accent-red transition-all"
+                    title="Discard permanently (audited)"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                  </button>
+                </div>
+              </div>
+            ))}
           </div>
         )}
       </motion.div>
@@ -1040,7 +1235,6 @@ export default function IntegrationHub() {
               </div>
 
               <div className="space-y-2 max-h-[320px] overflow-y-auto pr-1">
-                {/* Static log entries for demo */}
                 {selected.lastSync && (
                   <div className="flex items-start gap-3 p-2.5 bg-white/[0.02] rounded-md border border-white/[0.04]">
                     <CheckCircle className="w-3.5 h-3.5 text-accent-green shrink-0 mt-0.5" />
@@ -1078,7 +1272,24 @@ export default function IntegrationHub() {
                     </div>
                   </div>
                 )}
-                {!selected.lastSync && !selected.lastError && (
+                {/* Real audit trail entries for integration operations */}
+                {endpointLogs.map((log, idx) => (
+                  <div
+                    key={`${log.timestamp}-${idx}`}
+                    className="flex items-start gap-3 p-2.5 bg-white/[0.02] rounded-md border border-white/[0.04]"
+                  >
+                    <FileText className="w-3.5 h-3.5 text-text-secondary shrink-0 mt-0.5" />
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs text-text-primary font-mono">{log.action}</p>
+                      <p className="text-[10px] text-text-secondary break-words">{log.details}</p>
+                    </div>
+                    <span className="text-[10px] text-text-secondary font-mono shrink-0">
+                      {new Date(log.timestamp).toLocaleString()}
+                    </span>
+                  </div>
+                ))}
+
+                {!selected.lastSync && !selected.lastError && endpointLogs.length === 0 && (
                   <p className="text-xs text-text-secondary text-center py-4">No logs available yet</p>
                 )}
               </div>

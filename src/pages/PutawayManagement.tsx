@@ -2,10 +2,13 @@ import { useState, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { db, logAction } from '@/lib/db';
 import { completePutawayTransactional } from '@/lib/lifecycle';
+import { getStockScope, type StockScope } from '@/lib/stockBalances';
+import { getActiveWarehouseCode } from '@/lib/supabaseSync';
 import { useAuth } from '@/lib/auth';
+import BarcodeReader from '@/components/BarcodeReader';
 import {
   ArrowDownToLine, MapPin, PlayCircle, CheckCircle2, Clock,
-  Search, Package, Truck, RefreshCw, User, Zap,
+  Search, Package, Truck, RefreshCw, User, Zap, ScanLine,
 } from 'lucide-react';
 import type { PutawayTask } from '@/lib/db';
 
@@ -24,9 +27,19 @@ export default function PutawayManagement() {
   const [filter, setFilter] = useState<'all' | 'pending' | 'in_progress' | 'completed'>('all');
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [selected, setSelected] = useState<PutawayTask | null>(null);
+  const [scope, setScope] = useState<StockScope>({ tenantCode: '', warehouseCode: '' });
+  // Destination-bin scan: putaway is only confirmed against a bin the operator
+  // actually proved they stood at.
+  const [scannedBin, setScannedBin] = useState('');
+  const [scanOpen, setScanOpen] = useState(false);
 
   const loadTasks = useCallback(async () => {
-    const all = await db.putawayTasks.toArray();
+    const active = await getStockScope(await getActiveWarehouseCode());
+    setScope(active);
+    const all = await db.putawayTasks
+      .where('[tenantCode+warehouseCode]')
+      .equals([active.tenantCode, active.warehouseCode])
+      .toArray();
     const sorted = all.sort((a, b) => {
       const order = { pending: 0, assigned: 1, in_progress: 2, completed: 3, cancelled: 4 };
       if (order[a.status] !== order[b.status]) return order[a.status] - order[b.status];
@@ -54,6 +67,7 @@ export default function PutawayManagement() {
   };
 
   const startTask = async (task: PutawayTask) => {
+    setScannedBin('');
     await db.putawayTasks.update(task.id!, {
       status: 'in_progress',
       assignedTo: user?.displayName || 'operator',
@@ -64,7 +78,7 @@ export default function PutawayManagement() {
     loadTasks();
   };
 
-  const completeTask = async (task: PutawayTask, actualLocation?: string) => {
+  const completeTask = async (task: PutawayTask, actualLocation?: string, scannedCode?: string) => {
     if (!task.id) return;
     try {
       const res = await completePutawayTransactional({
@@ -72,11 +86,15 @@ export default function PutawayManagement() {
         actualLocation: actualLocation || task.suggestedLocation,
         operator: user?.displayName || 'operator',
         operatorRole: user?.role || 'operator',
+        // When the operator scanned the destination bin label, replay it so the
+        // posting is verified against the bin rather than trusting the suggestion.
+        scannedCode,
       });
       setMessage({
         type: 'success',
-        text: `Putaway ${task.taskId} confirmed → ${res.location} (allocatable stock: ${res.newStock})`,
+        text: `Putaway ${task.taskId} confirmed → ${res.location}/${res.lotNumber} (warehouse on-hand: ${res.newStock})`,
       });
+      setScannedBin('');
       setSelected(null);
       loadTasks();
     } catch (err) {
@@ -235,7 +253,9 @@ export default function PutawayManagement() {
           ))}
         </AnimatePresence>
         {filtered.length === 0 && (
-          <div className="text-center py-12 text-text-secondary text-sm">No putaway tasks match your filters</div>
+          <div className="text-center py-12 text-text-secondary text-sm">
+            No putaway tasks match your filters{scope.warehouseCode ? ` in ${scope.warehouseCode}` : ''}
+          </div>
         )}
       </div>
 
@@ -259,12 +279,46 @@ export default function PutawayManagement() {
                 <div><span className="text-text-secondary">Distance</span><p className="text-white">{selected.distance || '—'}m</p></div>
                 {selected.assignedTo && <div><span className="text-text-secondary">Assigned</span><p className="text-white flex items-center gap-1"><User className="w-3 h-3" />{selected.assignedTo}</p></div>}
               </div>
+              {selected.status === 'in_progress' && (
+                <div className="mt-5 rounded-xl border border-white/[0.08] bg-white/[0.02] p-3">
+                  <div className="flex items-center justify-between gap-2 mb-2">
+                    <span className="text-[10px] text-text-secondary uppercase tracking-widest flex items-center gap-1.5">
+                      <ScanLine className="w-3.5 h-3.5 text-accent-sky" />
+                      Destination bin scan
+                    </span>
+                    <button
+                      onClick={() => setScanOpen((v) => !v)}
+                      className="text-[10px] text-accent-sky hover:underline"
+                    >
+                      {scanOpen ? 'Hide scanner' : 'Use camera'}
+                    </button>
+                  </div>
+                  <input
+                    type="text"
+                    value={scannedBin}
+                    onChange={(e) => setScannedBin(e.target.value.toUpperCase())}
+                    className="w-full bg-transparent border-b border-white/10 text-text-primary text-sm py-2 px-1 focus:outline-none focus:border-accent-sky transition-colors font-mono"
+                    placeholder={`Scan ${selected.suggestedLocation} to verify`}
+                  />
+                  {scanOpen && (
+                    <div className="mt-2">
+                      <BarcodeReader onScan={(code) => { setScannedBin(code.toUpperCase()); setScanOpen(false); }} />
+                    </div>
+                  )}
+                  <p className="text-[10px] text-text-secondary/70 mt-2 leading-relaxed">
+                    Confirming without a scan posts to the suggested bin{' '}
+                    <span className="font-mono">{selected.suggestedLocation}</span>. A scanned bin that does not match
+                    is rejected with <span className="font-mono">PUTAWAY_SCAN_MISMATCH</span>.
+                  </p>
+                </div>
+              )}
+
               <div className="flex gap-2 mt-6">
                 {selected.status === 'pending' && (
                   <button onClick={() => startTask(selected)} className="flex-1 py-2.5 rounded-xl text-sm font-medium bg-accent-sky/15 text-accent-sky border border-accent-sky/20">Start Putaway</button>
                 )}
                 {selected.status === 'in_progress' && (
-                  <button onClick={() => completeTask(selected)} className="flex-1 py-2.5 rounded-xl text-sm font-medium bg-accent-green/15 text-accent-green border border-accent-green/20">Confirm Putaway</button>
+                  <button onClick={() => completeTask(selected, undefined, scannedBin)} className="flex-1 py-2.5 rounded-xl text-sm font-medium bg-accent-green/15 text-accent-green border border-accent-green/20">Confirm Putaway</button>
                 )}
                 <button onClick={() => setSelected(null)} className="px-4 py-2.5 rounded-xl text-sm text-text-secondary border border-white/[0.08]">Close</button>
               </div>

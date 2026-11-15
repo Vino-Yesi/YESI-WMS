@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import * as XLSX from 'xlsx';
+import { readWorkbookFile, describeSpreadsheetError } from '@/lib/spreadsheet';
 import {
   Upload, Package, PackageCheck, Truck, ClipboardList, Layers,
   FileSpreadsheet, CheckCircle2, ArrowRight, AlertTriangle,
@@ -646,10 +647,9 @@ export default function DailyManual() {
     setBusy(true);
     setMessage(null);
     try {
-      const buf = await file.arrayBuffer();
-      const wb = XLSX.read(buf, { type: "array" });
-      const sheet = wb.Sheets[wb.SheetNames[0]];
-      const json = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "", blankrows: false }) as unknown[][];
+      // Hardened boundary: an Ozon posting sheet is third-party input.
+      const wb = await readWorkbookFile(file);
+      const json = (wb.sheets[0]?.rows ?? []) as unknown[][];
       const parsed = parsePostingSheet(json);
       if (!parsed.length) {
         setMessage({
@@ -660,7 +660,7 @@ export default function DailyManual() {
       }
       await applyRows(parsed, file.name);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : "Failed to read XLSX";
+      const msg = describeSpreadsheetError(e);
       setFileError(msg);
       setMessage({ type: 'err', text: `File error: ${msg}. Check the file is a valid .xlsx/.xls with Tracking id, products, qty.` });
     } finally {

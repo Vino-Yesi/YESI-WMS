@@ -21,9 +21,16 @@ interface OrderLineItem {
 }
 
 interface TrackingResult {
-  status: 'in_transit' | 'delivered' | 'out_for_delivery';
+  /**
+   * Derived from OUR OWN dispatch records. This system has no live carrier
+   * tracking feed, so it must never invent a carrier status or location.
+   */
+  status: 'dispatched' | 'awaiting_dispatch' | 'returned';
   location: string;
   updatedAt: string;
+  carrier: string;
+  trackingNumber: string;
+  source: 'wms_dispatch_record';
 }
 
 const mockFromAddress = {
@@ -195,6 +202,8 @@ export default function Shipping() {
     }
   };
 
+  const [dispatchDetail, setDispatchDetail] = useState<string>('');
+
   const handleShipOrder = async () => {
     if (!selectedOrder?.id || !selectedRate || !generatedLabel) {
       setMessage({ type: 'error', text: 'Generate label before shipping.' });
@@ -204,7 +213,7 @@ export default function Shipping() {
       const weight = calculateOrderWeight(selectedOrder);
       const dims = calculateOrderDimensions(selectedOrder);
 
-      const { shipmentRef } = await dispatchShipmentTransactional({
+      const { shipmentRef, dispatchedBins, shippedAt } = await dispatchShipmentTransactional({
         orderRecordId: selectedOrder.id,
         labelRecordId: generatedLabel.id,
         carrier: selectedRate.carrier,
@@ -212,6 +221,13 @@ export default function Shipping() {
         operator: user?.displayName || 'Operator',
         operatorRole: user?.role || 'operator',
       });
+      // Report the exact bins/lots the units were released from, so the manifest
+      // matches the physical pick and any FEFO deviation is visible immediately.
+      setDispatchDetail(
+        dispatchedBins.length > 0
+          ? `${dispatchedBins.map((b) => `${b.qty}× ${b.sku} @ ${b.location}/${b.lotNumber}`).join(', ')} · ${new Date(shippedAt).toLocaleTimeString()}`
+          : '',
+      );
 
       await db.orders.update(selectedOrder.id, {
         service: selectedRate.service,
@@ -230,21 +246,39 @@ export default function Shipping() {
       await loadData();
       setMessage({
         type: 'success',
-        text: `Shipment ${shipmentRef}: Order ${orderIdCopy} dispatched & stock ledger updated!`,
+        text: dispatchDetail
+          ? `Shipment ${shipmentRef}: Order ${orderIdCopy} dispatched — ${dispatchDetail}`
+          : `Shipment ${shipmentRef}: Order ${orderIdCopy} dispatched & stock ledger updated!`,
       });
+      setDispatchDetail('');
     } catch (err) {
       setMessage({ type: 'error', text: err instanceof Error ? err.message : 'Shipment dispatch failed' });
     }
   };
 
-  const handleTrack = (order: Order) => {
-    const statuses: TrackingResult['status'][] = ['in_transit', 'delivered', 'out_for_delivery'];
-    const status = statuses[Math.floor(Math.random() * statuses.length)];
-    const locations = ['Distribution Center NY', 'Regional Hub Chicago', 'Local Facility LA', 'Delivery Station SF'];
+  const handleTrack = async (order: Order) => {
+    // Reconstruct the trail from the immutable local movement ledger + the order
+    // record. No random statuses, no invented geographies.
+    const status: TrackingResult['status'] =
+      order.status === 'Returned' ? 'returned' : order.status === 'Shipped' ? 'dispatched' : 'awaiting_dispatch';
+
+    const movements = await db.inventoryMovements
+      .where('orderId')
+      .equals(order.orderId)
+      .reverse()
+      .limit(1)
+      .toArray();
+    const lastBin = movements[0]?.fromLocation || movements[0]?.toLocation;
+
     const result: TrackingResult = {
       status,
-      location: locations[Math.floor(Math.random() * locations.length)],
-      updatedAt: new Date().toISOString(),
+      location:
+        lastBin ??
+        (order.warehouseCode ? `${order.warehouseCode} (bin detail not recorded)` : 'Warehouse of origin'),
+      updatedAt: order.shippedAt || order.updatedAt || new Date().toISOString(),
+      carrier: order.carrier || 'Unassigned carrier',
+      trackingNumber: order.trackingNumber || 'No tracking number issued',
+      source: 'wms_dispatch_record',
     };
     setTrackingModal({ order, result });
   };
@@ -256,8 +290,17 @@ export default function Shipping() {
   };
 
   // ─── Stats ────────────────────────────────────────────────────────────
-  const todayISO = new Date().toISOString().split('T')[0];
-  const shippedToday = shippedOrders.filter(o => o.updatedAt?.startsWith(todayISO)).length;
+  const startOfToday = useMemo(() => {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return d.getTime();
+  }, []);
+  // Real dispatch timestamps only — an order edited after shipping must not be
+  // counted as shipped today.
+  const shippedToday = shippedOrders.filter((o) => {
+    const at = o.shippedAt ? new Date(o.shippedAt).getTime() : NaN;
+    return Number.isFinite(at) && at >= startOfToday;
+  }).length;
   const pendingShipments = readyOrders.length;
   const avgShippingCost = useMemo(() => {
     const costs = shippedOrders.map(o => o.shippingCost).filter(Boolean) as number[];
@@ -916,21 +959,29 @@ export default function Shipping() {
                   <div className="flex items-center justify-between">
                     <span className="text-xs text-text-secondary">Status</span>
                     <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${
-                      trackingModal.result.status === 'delivered' ? 'bg-accent-green/10 text-accent-green' :
-                      trackingModal.result.status === 'out_for_delivery' ? 'bg-accent-yellow/10 text-accent-yellow' :
+                      trackingModal.result.status === 'dispatched' ? 'bg-accent-green/10 text-accent-green' :
+                      trackingModal.result.status === 'returned' ? 'bg-accent-yellow/10 text-accent-yellow' :
                       'bg-white/[0.05] text-text-primary'
                     }`}>
                       {trackingModal.result.status.replace(/_/g, ' ')}
                     </span>
                   </div>
                   <div className="flex items-center justify-between">
-                    <span className="text-xs text-text-secondary">Location</span>
-                    <span className="text-xs text-text-primary">{trackingModal.result.location}</span>
+                    <span className="text-xs text-text-secondary">Carrier</span>
+                    <span className="text-xs text-text-primary">{trackingModal.result.carrier}</span>
+                  </div>
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-xs text-text-secondary shrink-0">Last known bin</span>
+                    <span className="text-xs text-text-primary font-mono text-right break-all">{trackingModal.result.location}</span>
                   </div>
                   <div className="flex items-center justify-between">
-                    <span className="text-xs text-text-secondary">Updated</span>
+                    <span className="text-xs text-text-secondary">Dispatched</span>
                     <span className="text-xs text-text-primary">{new Date(trackingModal.result.updatedAt).toLocaleString()}</span>
                   </div>
+                  <p className="text-[10px] text-text-secondary/70 leading-relaxed">
+                    Sourced from this WMS's own dispatch ledger. No live carrier tracking feed is connected, so no
+                    in-transit status is inferred.
+                  </p>
                 </div>
                 <button
                   onClick={() => setTrackingModal(null)}

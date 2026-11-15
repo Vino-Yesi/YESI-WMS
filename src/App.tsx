@@ -1,7 +1,7 @@
 import { Routes, Route, Navigate } from 'react-router-dom';
 import { AuthProvider, useAuth } from '@/lib/auth';
-import { seedDatabase } from '@/lib/db';
-import { startHybridSyncEngine, setActiveWarehouseCode } from '@/lib/supabaseSync';
+import { seedDatabase, DEMO_SEED_ENABLED, requiresBootstrap } from '@/lib/db';
+import { startHybridSyncEngine, setActiveWarehouseCode, migrateLegacyOutbox } from '@/lib/supabaseSync';
 import { runtimeConfig } from '@/lib/config';
 import { useEffect, useState, Suspense, lazy, type ComponentType } from 'react';
 import Layout from '@/components/Layout';
@@ -218,6 +218,9 @@ function AppRoutes() {
 export default function App() {
   const [bootState, setBootState] = useState<'booting' | 'ready' | 'degraded'>('booting');
   const [bootWarning, setBootWarning] = useState<string | null>(null);
+  // Surfaces the build-time seeding posture so a production deployment can never
+  // silently ship demo credentials.
+  const demoSeedPosture = DEMO_SEED_ENABLED ? 'demo-seed enabled' : 'demo-seed disabled';
 
   useEffect(() => {
     let cancelled = false;
@@ -228,11 +231,27 @@ export default function App() {
       );
 
       try {
-        await Promise.race([seedDatabase(), timeout]);
+        const seedResult = await Promise.race([seedDatabase(), timeout]);
+        // Move any v2 JSON-blob sync queue into the indexed outbox table before
+        // the sync engine starts draining, so offline work is never lost or
+        // double-submitted by a second tab.
+        await migrateLegacyOutbox().catch(() => undefined);
+
         if (!cancelled) {
-          if (runtimeConfig.errors.length > 0) {
-            setBootWarning(runtimeConfig.errors.join(' '));
+          const notices: string[] = [...runtimeConfig.errors];
+          if (runtimeConfig.warnings.length > 0 && runtimeConfig.errors.length === 0) {
+            notices.push(runtimeConfig.warnings[0]);
           }
+          if (seedResult.demoSeeded) {
+            notices.push(
+              'DEMO DATASET ACTIVE: seeded operator accounts and sample stock are development data. Set VITE_WMS_ENABLE_DEMO_SEED=false (or build for production) to disable them.',
+            );
+          } else if (await requiresBootstrap()) {
+            notices.push(
+              'FIRST RUN: no operator account exists yet. Complete the administrator bootstrap on the sign-in screen before starting floor operations.',
+            );
+          }
+          if (notices.length > 0) setBootWarning(notices.join(' '));
           setBootState('ready');
         }
       } catch (err) {
@@ -259,6 +278,9 @@ export default function App() {
       <div className="fixed inset-0 flex flex-col items-center justify-center bg-black gap-3">
         <div className="w-10 h-10 border-2 border-accent-sky border-t-transparent rounded-full animate-spin" />
         <p className="text-xs text-white/50 font-mono">Initializing YESI-WMS Edge Storage…</p>
+        <p className="text-[10px] text-white/30 font-mono uppercase tracking-widest">
+          {runtimeConfig.isProduction ? 'production build' : 'development build'} · {demoSeedPosture}
+        </p>
       </div>
     );
   }

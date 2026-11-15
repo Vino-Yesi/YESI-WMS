@@ -110,6 +110,18 @@ export default defineConfig(({ command }) => ({
   },
   envPrefix: ['VITE_', 'TAURI_'],
   clearScreen: false,
+  /**
+   * Unit tests (vitest) live in `src/__tests__` and run against a DOM shim +
+   * fake IndexedDB. Playwright owns `e2e/` and is invoked separately
+   * (`npm run test:e2e`), so it is excluded here to keep a bare `vitest`
+   * run from failing on browser-driver specs.
+   */
+  test: {
+    environment: 'happy-dom',
+    include: ['src/**/*.test.{ts,tsx}'],
+    exclude: ['e2e/**', 'node_modules/**', 'dist/**'],
+    restoreMocks: true,
+  },
   resolve: {
     alias: { "@": path.resolve(__dirname, "./src") },
     dedupe: ['react', 'react-dom', 'react-router', 'react-router-dom'],

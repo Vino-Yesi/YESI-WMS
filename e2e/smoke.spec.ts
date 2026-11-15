@@ -1,81 +1,128 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, type Page } from '@playwright/test';
 
 /**
- * End-to-end smoke: login → dashboard → inbound → pick-pack → shipping → guardian resolve.
- * Requires a production build (`npm run build`) so `preview` serves dist/.
+ * End-to-end smoke: first-run bootstrap → dashboard → the eight lifecycle
+ * stages → session persistence across a reload.
+ *
+ * Requires a production build (`npm run build`) so `preview` serves `dist/`.
+ *
+ * There are deliberately no hard-coded credentials here. The app ships without
+ * seeded logins, so the smoke test drives the same first-run flow an operator
+ * meets on a fresh warehouse tablet: the login screen reports that no
+ * administrator exists, offers **Bootstrap first admin**, and closes that door
+ * permanently once one account exists. The password below is generated per run
+ * in a throwaway browser profile and is never a real credential.
  */
+
+const ADMIN_USERNAME = 'e2e.floor.admin';
+
+/**
+ * A per-run throwaway password that satisfies `validatePasswordStrength`:
+ * ≥10 characters, at least 3 of 4 character classes, not equal to the username
+ * and not a common password.
+ */
+function throwawayPassword(): string {
+  return `E2e!Floor-${Date.now().toString(36)}Aa9`;
+}
+
+const CORE_ROUTES = [
+  '/dock',
+  '/inbound',
+  '/qc',
+  '/putaway',
+  '/inventory',
+  '/pick-pack',
+  '/shipping',
+  '/returns',
+  '/cloud',
+  '/guardian',
+];
+
+async function headingOf(page: Page): Promise<string> {
+  return (await page.locator('h1').first().innerText()).trim();
+}
+
+/** Boots a fresh warehouse: creates the first administrator, or signs in if one exists. */
+async function authenticate(page: Page, password: string): Promise<'bootstrap' | 'signin'> {
+  await page.goto('/');
+  // ProtectedRoute bounces an unauthenticated visitor to /login.
+  await expect(page).toHaveURL(/\/login/, { timeout: 30_000 });
+  await expect(page.locator('h1').first()).toBeVisible({ timeout: 30_000 });
+
+  const heading = await headingOf(page);
+
+  if (/First-Run Setup/i.test(heading)) {
+    await expect(page.getByText(/Create the first administrator for/i)).toBeVisible();
+
+    await page.getByPlaceholder('floor.admin').fill(ADMIN_USERNAME);
+    await page.getByPlaceholder('Floor Administrator').fill('E2E Floor Administrator');
+    await page.getByPlaceholder('ops@yesi.example').fill('e2e@yesi.example');
+    // Bootstrap renders exactly two password fields: the new password and its
+    // confirmation. `autoComplete` distinguishes them without depending on
+    // DOM order.
+    await page.locator('input[autocomplete="current-password"]').first().fill(password);
+    await page.locator('input[autocomplete="new-password"]').first().fill(password);
+
+    // The warehouse scope selector must be present and pre-filled: every screen
+    // is bound to exactly one facility.
+    const scope = page.locator('select');
+    await expect(scope.first()).toBeVisible();
+    expect((await scope.first().inputValue()).length).toBeGreaterThan(0);
+
+    await page.getByRole('button', { name: /Create first administrator/i }).click();
+    await expect(page).toHaveURL(/\/($|\?)/, { timeout: 30_000 });
+    return 'bootstrap';
+  }
+
+  expect(heading, 'login screen heading').toMatch(/Yesi-WMS Lite|Credential Rotation/i);
+  await page.getByPlaceholder('username').fill(ADMIN_USERNAME);
+  await page.locator('input[autocomplete="current-password"]').first().fill(password);
+  await page.getByRole('button', { name: /^Sign in$/i }).click();
+  await expect(page).toHaveURL(/\/($|\?)/, { timeout: 30_000 });
+  return 'signin';
+}
+
 test.describe('WMS smoke flow', () => {
-  test('login and navigate core ops pages', async ({ page }) => {
-    await page.goto('/');
+  test('first-run bootstrap, core lifecycle routes and session persistence', async ({ page }) => {
+    const password = throwawayPassword();
+    const mode = await authenticate(page, password);
+    expect(mode, 'a fresh browser profile has no administrator, so bootstrap is expected').toBe('bootstrap');
 
-    // Seed + auth init
-    await page.waitForSelector('input, button', { timeout: 30_000 });
+    // The encrypted session envelope survives a reload without re-prompting.
+    await page.reload();
+    await expect(page).toHaveURL(/\/($|\?)/, { timeout: 30_000 });
+    await expect(page.getByText(/something went wrong/i)).toHaveCount(0);
 
-    // Login page
-    const userInput = page.locator('input').first();
-    await expect(userInput).toBeVisible({ timeout: 15_000 });
-
-    // Fill credentials (default seed users)
-    const inputs = page.locator('input');
-    const count = await inputs.count();
-    // username
-    await inputs.nth(0).fill('VINOVJ');
-    // password (second text/password field)
-    if (count > 1) {
-      await inputs.nth(1).fill('VINOVJ');
-    }
-
-    // Submit
-    const loginBtn = page.getByRole('button', { name: /sign in|log in|login/i }).first();
-    if (await loginBtn.count()) {
-      await loginBtn.click();
-    } else {
-      await page.keyboard.press('Enter');
-    }
-
-    // Land on dashboard
-    await expect(page).toHaveURL(/\/($|\?)/, { timeout: 20_000 });
-    await page.waitForTimeout(800);
-
-    // Navigate via sidebar / routes across all 12 WMS domains
-    const routes = [
-      { path: '/dock', hint: /dock|appointment/i },
-      { path: '/inbound', hint: /inbound|receiving/i },
-      { path: '/putaway', hint: /putaway/i },
-      { path: '/qc', hint: /qc|quality|hold/i },
-      { path: '/inventory', hint: /inventory|sku/i },
-      { path: '/pick-pack', hint: /pick|pack/i },
-      { path: '/shipping', hint: /ship/i },
-      { path: '/returns', hint: /return/i },
-      { path: '/cloud', hint: /cloud|postgresql|ledger/i },
-      { path: '/guardian', hint: /guardian|critical|scenario/i },
-    ];
-
-    for (const r of routes) {
-      await page.goto(r.path);
-      await page.waitForTimeout(600);
-      // Page should not show error boundary
+    // Walk every operational domain: no route may hit the error boundary, and
+    // each must render real content for the single warehouse in scope.
+    for (const route of CORE_ROUTES) {
+      await page.goto(route);
+      // The PWA service worker keeps connections warm, so `networkidle` may never
+      // settle: bound the wait and carry on regardless.
+      await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => {});
       await expect(page.getByText(/something went wrong/i)).toHaveCount(0);
-      // Some operational content should appear
-      const body = await page.locator('main, body').innerText();
-      expect(body.length).toBeGreaterThan(20);
+      const body = await page.locator('main, body').first().innerText();
+      expect(body.length, `${route} rendered no content`).toBeGreaterThan(20);
     }
 
-    // Guardian: attempt resolve if a scenario card exists
+    // Guardian Ops Center: resolve an active scenario when one is offered.
     await page.goto('/guardian');
-    await page.waitForTimeout(1000);
     const resolveBtn = page.getByRole('button', { name: /resolve|auto|apply/i }).first();
     if (await resolveBtn.count()) {
       await resolveBtn.click();
       await page.waitForTimeout(500);
+      await expect(page.getByText(/something went wrong/i)).toHaveCount(0);
     }
 
-    // Density toggle exists in top bar
+    // Density toggle in the top bar.
     await page.goto('/');
-    const densityBtn = page.locator('header button[title*="density" i], header button[title*="compact" i], header button[title*="comfortable" i]').first();
+    const densityBtn = page
+      .locator('header button[title*="density" i], header button[title*="compact" i], header button[title*="comfortable" i]')
+      .first();
     if (await densityBtn.count()) {
       await densityBtn.click();
       await page.waitForTimeout(200);
+      await expect(page.getByText(/something went wrong/i)).toHaveCount(0);
     }
   });
 });

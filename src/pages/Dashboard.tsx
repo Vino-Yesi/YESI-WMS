@@ -1,6 +1,8 @@
 import { useEffect, useState, useCallback, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { db, type InventoryMovement } from '@/lib/db';
+import { getStockScope } from '@/lib/stockBalances';
+import { getActiveWarehouseCode, getSyncState, subscribeSyncState, type SyncSnapshotState } from '@/lib/supabaseSync';
 import { useAppStore } from '@/lib/store';
 import KineticCounter from '@/components/KineticCounter';
 import StatusBadge from '@/components/StatusBadge';
@@ -27,6 +29,14 @@ interface Stats {
   waveActive: number;
   workerTasksActive: number;
   avgFulfillmentRate: number;
+  /** v3: dimensional truth for the active warehouse */
+  warehouseCode: string;
+  reservedUnits: number;
+  quarantineUnits: number;
+  availableUnits: number;
+  activeBins: number;
+  multiBinSkus: number;
+  shippedAllTime: number;
 }
 
 interface ForecastAlert {
@@ -45,6 +55,8 @@ export default function Dashboard() {
     totalStock: 0, lowStock: 0, pendingOrders: 0, shippedToday: 0,
     totalReturns: 0, totalSkus: 0, qcHolds: 0, pendingCounts: 0,
     reorderAlerts: 0, postingCount: 0, waveActive: 0, workerTasksActive: 0, avgFulfillmentRate: 0,
+    warehouseCode: '', reservedUnits: 0, quarantineUnits: 0, availableUnits: 0,
+    activeBins: 0, multiBinSkus: 0, shippedAllTime: 0,
   });
   const [recentOrders, setRecentOrders] = useState<Order[]>([]);
   const [lowStockItems, setLowStockItems] = useState<InventoryItem[]>([]);
@@ -52,14 +64,25 @@ export default function Dashboard() {
   const [forecastAlerts, setForecastAlerts] = useState<ForecastAlert[]>([]);
   const [lastRefresh, setLastRefresh] = useState<string>('');
   const [refreshing, setRefreshing] = useState(false);
+  const [sync, setSync] = useState<SyncSnapshotState>(() => getSyncState());
+
+  // Live cloud-sync posture: real queue depth, real round-trip latency and the
+  // authoritative KPI row from `v_wms_kpi_summary` when cloud mode is active.
+  useEffect(() => subscribeSyncState(setSync), []);
 
   const loadStats = useCallback(async () => {
     setRefreshing(true);
     try {
+      // Strict warehouse scoping: the dashboard reports ONE site, never a global
+      // sum across facilities.
+      const scope = await getStockScope(await getActiveWarehouseCode());
+      const whPair = [scope.tenantCode, scope.warehouseCode] as [string, string];
+
       // Parallel indexed/bounded queries instead of 9 sequential full-table scans
       const [
         inventory,
         orders,
+        balances,
         returnsCount,
         qcHoldsCount,
         pendingCounts,
@@ -68,22 +91,49 @@ export default function Dashboard() {
         workerTasksActive,
         movements,
       ] = await Promise.all([
-        db.inventory.toArray(),
-        db.orders.toArray(),
-        db.returns.count(),
-        db.qcHolds.where('status').equals('hold').count(),
+        db.inventory.where('[tenantCode+warehouseCode]').equals(whPair).toArray(),
+        db.orders.where('[tenantCode+warehouseCode]').equals(whPair).toArray(),
+        db.stockBalances.where('[tenantCode+warehouseCode]').equals(whPair).toArray(),
+        db.returns.where('[tenantCode+warehouseCode]').equals(whPair).count(),
+        db.qcHolds.where('[tenantCode+warehouseCode]').equals(whPair).and((q) => q.status === 'hold').count(),
         db.cycleCounts.where('status').equals('pending').count(),
         db.postingRecords.count(),
         db.waveBatches.where('status').anyOf(['open', 'picking']).count(),
         db.workerTasks.where('status').equals('in_progress').count(),
-        db.inventoryMovements.reverse().limit(5).toArray(),
+        db.inventoryMovements.where('[tenantCode+warehouseCode]').equals(whPair).reverse().limit(5).toArray(),
       ]);
 
-      const totalStock = inventory.reduce((sum, item) => sum + (item.stock || 0), 0);
-      const lowStock = inventory.filter((item) => (item.stock || 0) < (item.reorderPoint || 10));
-      const pending = orders.filter((o) => o.status === 'Pending' || o.status === 'Picking');
+      // Dimensional truth: totals come from the balance rows, so quarantine and
+      // reserved units are visible instead of being folded into "total stock".
+      const totalStock = balances.reduce((sum, b) => sum + (b.onHandQty || 0), 0);
+      const reservedUnits = balances.reduce((sum, b) => sum + (b.reservedQty || 0), 0);
+      const quarantineUnits = balances.reduce((sum, b) => sum + (b.quarantineQty || 0), 0);
+      const availableUnits = balances
+        .filter((b) => b.stockStatus === 'AVAILABLE')
+        .reduce((sum, b) => sum + Math.max(0, (b.onHandQty || 0) - (b.reservedQty || 0) - (b.quarantineQty || 0)), 0);
+      const activeBins = new Set(balances.filter((b) => (b.onHandQty || 0) > 0).map((b) => b.location)).size;
+      const binsPerSku = new Map<string, Set<string>>();
+      for (const b of balances) {
+        if ((b.onHandQty || 0) <= 0) continue;
+        binsPerSku.set(b.sku, (binsPerSku.get(b.sku) ?? new Set<string>()).add(b.location));
+      }
+      const multiBinSkus = Array.from(binsPerSku.values()).filter((set) => set.size > 1).length;
+
+      const lowStock = inventory.filter((item) => (item.availableStock ?? item.stock ?? 0) < (item.reorderPoint || 10));
+      const pending = orders.filter((o) => ['Pending', 'Picking', 'Packed', 'ReadyToShip'].includes(o.status));
       const shipped = orders.filter((o) => o.status === 'Shipped');
-      const reorderAlerts = inventory.filter((item) => item.reorderPoint && (item.stock || 0) <= item.reorderPoint);
+
+      // "Shipped today" is derived from the real dispatch timestamp, bounded by
+      // local midnight — never from the total count of Shipped orders.
+      const startOfToday = new Date();
+      startOfToday.setHours(0, 0, 0, 0);
+      const shippedToday = orders.filter((o) => {
+        if (o.status !== 'Shipped' && o.status !== 'Returned') return false;
+        const at = o.shippedAt ? new Date(o.shippedAt).getTime() : NaN;
+        return Number.isFinite(at) && at >= startOfToday.getTime();
+      }).length;
+
+      const reorderAlerts = inventory.filter((item) => item.reorderPoint && (item.availableStock ?? item.stock ?? 0) <= item.reorderPoint);
       const totalShippable = pending.length + shipped.length;
 
       const velocityMultiplier = { high: 8, medium: 4, low: 1 } as const;
@@ -102,7 +152,7 @@ export default function Dashboard() {
         totalStock,
         lowStock: lowStock.length,
         pendingOrders: pending.length,
-        shippedToday: shipped.length,
+        shippedToday,
         totalReturns: returnsCount,
         totalSkus: inventory.length,
         qcHolds: qcHoldsCount,
@@ -112,6 +162,13 @@ export default function Dashboard() {
         waveActive,
         workerTasksActive,
         avgFulfillmentRate: totalShippable > 0 ? (shipped.length / totalShippable) * 100 : 0,
+        warehouseCode: scope.warehouseCode,
+        reservedUnits,
+        quarantineUnits,
+        availableUnits,
+        activeBins,
+        multiBinSkus,
+        shippedAllTime: shipped.length,
       });
 
       setRecentOrders(orders.slice(-5).reverse());
@@ -145,7 +202,7 @@ export default function Dashboard() {
       { label: 'Total Items', value: stats.totalStock, icon: Box, color: 'text-accent-sky', delay: 0 },
       { label: 'Low Stock', value: stats.lowStock, icon: AlertTriangle, color: 'text-accent-red', alert: true, delay: 0.05 },
       { label: 'Pending Orders', value: stats.pendingOrders, icon: Clock, color: 'text-accent-yellow', delay: 0.1 },
-      { label: 'Shipped', value: stats.shippedToday, icon: CheckCircle, color: 'text-accent-green', delay: 0.15 },
+      { label: 'Shipped Today', value: stats.shippedToday, icon: CheckCircle, color: 'text-accent-green', delay: 0.15 },
     ],
     [stats.totalStock, stats.lowStock, stats.pendingOrders, stats.shippedToday]
   );
@@ -179,6 +236,45 @@ export default function Dashboard() {
             Real-time warehouse performance overview
             {lastRefresh && <span className="ml-2 text-[10px] font-mono opacity-60">refreshed {lastRefresh}</span>}
           </p>
+          <div className="flex flex-wrap items-center gap-2 mt-2 text-[10px] font-mono">
+            <span className="px-2 py-0.5 rounded-full bg-accent-sky/10 text-accent-sky border border-accent-sky/20">
+              {stats.warehouseCode || 'NO SCOPE'}
+            </span>
+            <span
+              className={`px-2 py-0.5 rounded-full border ${
+                sync.status === 'synced'
+                  ? 'bg-accent-green/10 text-accent-green border-accent-green/20'
+                  : sync.status === 'error'
+                    ? 'bg-accent-red/10 text-accent-red border-accent-red/20'
+                    : sync.status === 'offline' || sync.status === 'unconfigured'
+                      ? 'bg-white/[0.05] text-text-secondary border-white/10'
+                      : 'bg-accent-yellow/10 text-accent-yellow border-accent-yellow/20'
+              }`}
+            >
+              {sync.status.toUpperCase()}
+              {sync.cloudLatencyMs != null ? ` · ${sync.cloudLatencyMs}ms` : ''}
+            </span>
+            {sync.pendingOutbox > 0 && (
+              <span className="px-2 py-0.5 rounded-full bg-accent-yellow/10 text-accent-yellow border border-accent-yellow/20">
+                {sync.pendingOutbox} queued
+              </span>
+            )}
+            {sync.deadLetterCount > 0 && (
+              <span className="px-2 py-0.5 rounded-full bg-accent-red/10 text-accent-red border border-accent-red/20">
+                {sync.deadLetterCount} dead-letter
+              </span>
+            )}
+            {stats.activeBins > 0 && (
+              <span className="px-2 py-0.5 rounded-full bg-white/[0.05] text-text-secondary border border-white/10">
+                {stats.activeBins} bins · {stats.multiBinSkus} multi-bin SKUs
+              </span>
+            )}
+            {stats.quarantineUnits > 0 && (
+              <span className="px-2 py-0.5 rounded-full bg-accent-red/10 text-accent-red border border-accent-red/20">
+                {stats.quarantineUnits} quarantined
+              </span>
+            )}
+          </div>
         </div>
         <div className="flex items-center gap-2">
           <button

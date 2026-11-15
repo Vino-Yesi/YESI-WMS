@@ -109,6 +109,20 @@ export interface WmsKpiSummaryRow {
   active_qc_holds: number;
   total_returns: number;
   outbox_pending: number;
+  /** v3 (migration 008): real dispatch + reliability columns */
+  shipped_today: number;
+  outbox_dead_letter: number;
+  allocation_conflicts: number;
+  avg_sync_latency_ms: number | null;
+  quarantine_units: number;
+  active_bins: number;
+}
+
+export interface WmsEdgeSecurityPosture {
+  cors_mode: 'strict_allowlist' | 'deny_all_browser_origins';
+  allowed_origin_count: number;
+  metrics_auth: 'enabled' | 'disabled';
+  webhook_auth: 'enabled' | 'disabled';
 }
 
 export interface WmsEdgeHealthResponse {
@@ -120,6 +134,43 @@ export interface WmsEdgeHealthResponse {
   timestamp: string;
   kpis: WmsKpiSummaryRow | null;
   error: string | null;
+  /** Present on gateway v3.0.0+ */
+  security?: WmsEdgeSecurityPosture;
+}
+
+/** Result of the v3 gateway's real leased outbox delivery. */
+export interface WmsFlushResult {
+  ok: boolean;
+  /** Kept for backwards compatibility: delivered + broadcast. */
+  published_count: number;
+  claimed?: number;
+  delivered?: number;
+  broadcast?: number;
+  failed?: number;
+  dead_lettered?: number;
+  http_targets?: string[];
+  failures?: Array<Record<string, unknown>>;
+  latency_ms?: number;
+  error?: string;
+}
+
+export interface WmsOutboxMetrics {
+  pending: number;
+  processing: number;
+  published: number;
+  failed: number;
+  dead_letter: number;
+  leased: number;
+  stale_leases: number;
+  dead_letter_queue: Array<{
+    id: string;
+    event_type: string;
+    aggregate_id: string | null;
+    retry_count: number;
+    error_message: string | null;
+    created_at: string;
+    last_attempt_at: string | null;
+  }>;
 }
 
 export async function checkEdgeGatewayHealth(warehouseCode = WMS_DEFAULT_WAREHOUSE): Promise<WmsEdgeHealthResponse> {
@@ -128,7 +179,7 @@ export async function checkEdgeGatewayHealth(warehouseCode = WMS_DEFAULT_WAREHOU
     return {
       status: 'offline',
       service: 'yesi-wms-edge-api',
-      version: '2.1.0',
+      version: '3.0.0',
       warehouse: warehouseCode,
       latency_ms: 0,
       timestamp: new Date().toISOString(),
@@ -156,7 +207,7 @@ export async function checkEdgeGatewayHealth(warehouseCode = WMS_DEFAULT_WAREHOU
     return {
       status: 'offline',
       service: 'yesi-wms-edge-api',
-      version: '2.1.0',
+      version: '3.0.0',
       warehouse: warehouseCode,
       latency_ms: Math.round(performance.now() - started),
       timestamp: new Date().toISOString(),
@@ -166,38 +217,135 @@ export async function checkEdgeGatewayHealth(warehouseCode = WMS_DEFAULT_WAREHOU
   }
 }
 
-export async function flushCloudOutbox(warehouseCode = WMS_DEFAULT_WAREHOUSE): Promise<{ ok: boolean; published_count: number; error?: string }> {
+async function callEdgeGateway<T>(
+  action: string,
+  opts: { warehouseCode?: string; body?: Record<string, unknown>; query?: Record<string, string>; requireSession?: boolean },
+): Promise<{ ok: boolean; status: number; data: T | null; error?: string }> {
   if (!isSupabaseConfigured) {
-    return { ok: false, published_count: 0, error: 'Cloud not configured' };
+    return { ok: false, status: 0, data: null, error: 'Cloud not configured (Offline-Edge Mode)' };
   }
+  const warehouseCode = (opts.warehouseCode || WMS_DEFAULT_WAREHOUSE).trim().toUpperCase();
   const sessionToken = getActiveServerSessionToken();
-  if (!sessionToken) {
-    return { ok: false, published_count: 0, error: 'Authenticated server session required' };
+  if (opts.requireSession !== false && !sessionToken) {
+    return { ok: false, status: 401, data: null, error: 'Authenticated server session required' };
   }
+
+  const query = new URLSearchParams({ action, ...(opts.query ?? {}) });
   try {
-    const res = await fetch(`${SUPABASE_URL}/functions/v1/wms-api?action=flush_outbox`, {
-      method: 'POST',
+    const res = await fetch(`${SUPABASE_URL}/functions/v1/wms-api?${query.toString()}`, {
+      method: opts.body ? 'POST' : 'GET',
       headers: {
         apikey: SUPABASE_ANON_KEY,
         'Content-Type': 'application/json',
         'x-tenant-code': WMS_TENANT_CODE,
         'x-warehouse-code': warehouseCode,
-        'x-session-token': sessionToken,
+        'x-device-id': typeof localStorage !== 'undefined' ? localStorage.getItem('vortex_device_id') || '' : '',
+        ...(sessionToken ? { 'x-session-token': sessionToken } : {}),
       },
-      body: JSON.stringify({
-        action: 'flush_outbox',
-        tenant_code: WMS_TENANT_CODE,
-        warehouse_code: warehouseCode,
-      }),
+      body: opts.body
+        ? JSON.stringify({ action, tenant_code: WMS_TENANT_CODE, warehouse_code: warehouseCode, ...opts.body })
+        : undefined,
     });
-    const body = (await res.json().catch(() => ({}))) as { ok?: boolean; published_count?: number; error?: string };
-    if (!res.ok || !body.ok) {
-      return { ok: false, published_count: 0, error: body.error || `HTTP ${res.status}` };
-    }
-    return { ok: true, published_count: body.published_count ?? 0 };
+    const body = (await res.json().catch(() => ({}))) as T & { error?: string };
+    if (!res.ok) return { ok: false, status: res.status, data: body ?? null, error: body?.error || `HTTP ${res.status}` };
+    return { ok: true, status: res.status, data: body ?? null };
   } catch (err) {
-    return { ok: false, published_count: 0, error: err instanceof Error ? err.message : 'Network error' };
+    return { ok: false, status: 0, data: null, error: err instanceof Error ? err.message : 'Network error' };
   }
+}
+
+/**
+ * Asks the v3 edge gateway to claim a leased batch of `wms_event_outbox` rows
+ * and deliver them to every configured HTTP subscriber (HMAC-signed), then
+ * report each outcome back through `wms_complete_outbox_event`.
+ */
+export async function flushCloudOutbox(warehouseCode = WMS_DEFAULT_WAREHOUSE): Promise<WmsFlushResult> {
+  const res = await callEdgeGateway<Record<string, unknown>>('flush_outbox', {
+    warehouseCode,
+    body: { action: 'flush_outbox' },
+  });
+  const data = res.data ?? {};
+  if (!res.ok || data.ok === false) {
+    return { ok: false, published_count: 0, error: res.error || String(data.error ?? 'Gateway refused the flush') };
+  }
+  const delivered = Number(data.delivered ?? 0);
+  const broadcast = Number(data.broadcast ?? 0);
+  return {
+    ok: true,
+    // v2 reported a single counter; v3 splits HTTP deliveries from realtime
+    // broadcasts. Keep the legacy field meaningful for existing callers.
+    published_count: Number(data.published_count ?? delivered + broadcast),
+    claimed: Number(data.claimed ?? 0),
+    delivered,
+    broadcast,
+    failed: Number(data.failed ?? 0),
+    dead_lettered: Number(data.dead_lettered ?? 0),
+    http_targets: Array.isArray(data.http_targets) ? (data.http_targets as string[]) : [],
+    failures: Array.isArray(data.failures) ? (data.failures as Array<Record<string, unknown>>) : [],
+    latency_ms: Number(data.latency_ms ?? 0),
+  };
+}
+
+/** Live outbox counters + the dead-letter queue from `wms_get_outbox_metrics`. */
+export async function fetchCloudOutboxMetrics(warehouseCode = WMS_DEFAULT_WAREHOUSE): Promise<WmsOutboxMetrics | null> {
+  const res = await callEdgeGateway<WmsOutboxMetrics>('outbox_metrics', {
+    warehouseCode,
+    body: { action: 'outbox_metrics' },
+  });
+  return res.ok ? res.data : null;
+}
+
+/** First-run bootstrap probe (`wms_get_bootstrap_status`). */
+export async function fetchBootstrapStatus(): Promise<{
+  bootstrap_required: boolean;
+  tenant_code: string | null;
+  active_users: number;
+  users_requiring_rotation: number;
+  bootstrap_completed_at: string | null;
+} | null> {
+  const res = await callEdgeGateway<Record<string, unknown>>('bootstrap_status', { requireSession: false });
+  if (!res.ok || !res.data) return null;
+  const d = res.data;
+  return {
+    bootstrap_required: Boolean(d.bootstrap_required),
+    tenant_code: (d.tenant_code as string) ?? null,
+    active_users: Number(d.active_users ?? 0),
+    users_requiring_rotation: Number(d.users_requiring_rotation ?? 0),
+    bootstrap_completed_at: (d.bootstrap_completed_at as string) ?? null,
+  };
+}
+
+/**
+ * Runs one server-authoritative lifecycle command through
+ * `wms_execute_command` (strictly idempotent via `wms_command_idempotency`).
+ */
+export async function executeCloudCommand(
+  command: string,
+  payload: Record<string, unknown>,
+  opts: { warehouseCode?: string; idempotencyKey?: string } = {},
+): Promise<{ ok: boolean; data: Record<string, unknown> | null; error?: string }> {
+  const res = await callEdgeGateway<Record<string, unknown>>('command', {
+    warehouseCode: opts.warehouseCode,
+    body: {
+      action: 'command',
+      command,
+      payload,
+      ...(opts.idempotencyKey ? { idempotency_key: opts.idempotencyKey } : {}),
+    },
+  });
+  return { ok: res.ok && res.data?.ok !== false, data: res.data, error: res.error || (res.data?.error as string | undefined) };
+}
+
+/** Reports a batch of client telemetry samples to `wms_operational_telemetry`. */
+export async function pushTelemetryBatch(
+  events: Array<Record<string, unknown>>,
+  warehouseCode = WMS_DEFAULT_WAREHOUSE,
+): Promise<boolean> {
+  const res = await callEdgeGateway<Record<string, unknown>>('telemetry', {
+    warehouseCode,
+    body: { action: 'telemetry', events },
+  });
+  return res.ok;
 }
 
 export function subscribeWmsRealtime(

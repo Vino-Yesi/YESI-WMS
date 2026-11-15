@@ -1,0 +1,35 @@
+# .gitleaksignore — reviewed, commit-scoped exceptions for the nightly
+# full-history audit (`scripts/gitleaks-ci.sh <version> history`).
+#
+# Format (see gitleaks detect/detect.go, AddGitleaksIgnore):
+#   file:rule-id:start-line                     global  — ignored in EVERY commit
+#   commit:file:rule-id:start-line              scoped  — ignored only in that commit
+# Only the scoped form is used here on purpose: a global entry would also silence
+# the same file and line in future commits, which is exactly where a real secret
+# would appear next.
+#
+# --------------------------------------------------------------------------------
+# Accepted 2026-11-15 — Supabase PUBLISHABLE (anon) key committed in 70405ba.
+#
+#   .env.example:3            VITE_SUPABASE_ANON_KEY=sb_publishable_...
+#   src/lib/supabase.ts:4     const FALLBACK_SUPABASE_ANON_KEY = 'sb_publishable_...'
+#
+# Why this is not treated as a breach: a Supabase publishable key is public by
+# design. It ships inside every browser bundle, identifies the project, and
+# grants nothing beyond what row-level security allows — this project verifies
+# 103 RLS policies with 0 tables missing RLS, and the privileged service-role key
+# lives only in Edge Function secrets (`SUPABASE_SERVICE_ROLE_KEY`), never in the
+# client. `scripts/security-check.mjs` blocks any service-role key or JWT from
+# being committed, and that gate passes on every run.
+#
+# Both lines are already gone from the current tree: `.env.example` ships empty
+# values, and `src/lib/supabase.ts` has no hard-coded fallback — an absent or
+# invalid key puts the app into Offline-Edge mode instead.
+#
+# Still recommended: rotate the publishable key in the Supabase dashboard if you
+# want the historical value to stop working. Rotating is cheap (update
+# VITE_SUPABASE_ANON_KEY wherever the app is deployed); rewriting git history is
+# not, and is not warranted for a value that was never secret.
+# --------------------------------------------------------------------------------
+70405ba30d24d798c057646d9b624cdaf60ab620:.env.example:generic-api-key:3
+70405ba30d24d798c057646d9b624cdaf60ab620:src/lib/supabase.ts:generic-api-key:4

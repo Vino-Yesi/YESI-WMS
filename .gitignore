@@ -21,3 +21,7 @@ blob-report/
 Thumbs.db
 *.log
 npm-debug.log*
+
+# gitleaks CI runner (scripts/gitleaks-ci.sh)
+.gitleaks-bin/
+gitleaks-full-history.json

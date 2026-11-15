@@ -1,5 +1,6 @@
 import { useMemo, useState, useCallback, useRef, type MouseEvent as ReactMouseEvent } from 'react';
 import * as XLSX from 'xlsx';
+import { readWorkbookFile, describeSpreadsheetError } from '@/lib/spreadsheet';
 import { motion, AnimatePresence, LayoutGroup } from 'framer-motion';
 import {
   Scale, Zap, AlertTriangle, CheckCircle, FileCheck, Upload,
@@ -489,18 +490,14 @@ export default function Auditor() {
 
   const loadWorkbook = async (file: File) => {
     try {
-      const buf = await file.arrayBuffer();
-      const wb = XLSX.read(buf, { type: 'array', cellDates: true });
-      setSheetNames(wb.SheetNames);
+      // Parsed through the hardened boundary: size/type guards first, and no
+      // cell value from an untrusted file reaches business logic un-coerced.
+      const wb = await readWorkbookFile(file, { cellDates: true });
+      setSheetNames(wb.sheetNames);
 
       const sheets: Record<string, OrderLine[]> = {};
-      for (const name of wb.SheetNames) {
-        const json = XLSX.utils.sheet_to_json(wb.Sheets[name], {
-          header: 1,
-          defval: '',
-          blankrows: false,
-        }) as unknown[][];
-        sheets[name] = cleanOrderRows(json);
+      for (const sheet of wb.sheets) {
+        sheets[sheet.name] = cleanOrderRows(sheet.rows as unknown[][]);
       }
 
       // Auto-detect expected vs actual by sheet name
@@ -515,12 +512,12 @@ export default function Auditor() {
         }
       }
       // Fallback: first two sheets
-      if (!expectedLines.length && !actualLines.length && wb.SheetNames.length >= 2) {
-        expectedLines = sheets[wb.SheetNames[0]] || [];
-        actualLines = sheets[wb.SheetNames[1]] || [];
-      } else if (!expectedLines.length && wb.SheetNames.length === 1) {
+      if (!expectedLines.length && !actualLines.length && wb.sheetNames.length >= 2) {
+        expectedLines = sheets[wb.sheetNames[0]] || [];
+        actualLines = sheets[wb.sheetNames[1]] || [];
+      } else if (!expectedLines.length && wb.sheetNames.length === 1) {
         // Single sheet — put in expected, user can paste actual
-        expectedLines = sheets[wb.SheetNames[0]] || [];
+        expectedLines = sheets[wb.sheetNames[0]] || [];
       }
 
       const toPaste = (lines: OrderLine[]) =>
@@ -533,36 +530,29 @@ export default function Auditor() {
         const rows = runDiscrepancyTest(ordersToMap(expectedLines), ordersToMap(actualLines));
         setResults(rows);
         setMessage(
-          `Workbook “${file.name}” · sheets: ${wb.SheetNames.join(', ')} · ${rows.length} order IDs compared`
+          `Workbook “${file.name}” · sheets: ${wb.sheetNames.join(', ')} · ${rows.length} order IDs compared`
         );
         logAction('AUDITOR_EXCEL', `${file.name} rows=${rows.length}`, operator);
       } else {
         setMessage(
-          `Loaded “${file.name}” (${wb.SheetNames.join(', ')}). Map data into Expected/Actual paste fields, then Run analysis.`
+          `Loaded “${file.name}” (${wb.sheetNames.join(', ')}). Map data into Expected/Actual paste fields, then Run analysis.`
         );
       }
-    } catch (e: any) {
-      setMessage(`XLSX parse failed: ${e?.message || e}`);
+    } catch (e) {
+      setMessage(`XLSX parse failed: ${describeSpreadsheetError(e)}`);
     }
   };
 
   const loadSideXlsx = async (file: File, side: 'master' | 'scan') => {
     try {
-      const buf = await file.arrayBuffer();
-      const wb = XLSX.read(buf, { type: 'array', cellDates: true });
-      const sheet = wb.Sheets[wb.SheetNames[0]];
-      const json = XLSX.utils.sheet_to_json(sheet, {
-        header: 1,
-        defval: '',
-        blankrows: false,
-      }) as unknown[][];
-      const lines = cleanOrderRows(json);
+      const wb = await readWorkbookFile(file, { cellDates: true });
+      const lines = cleanOrderRows((wb.sheets[0]?.rows ?? []) as unknown[][]);
       const text = lines.map((l) => `${l.orderId}\t${l.product}\t${l.quantity}`).join('\n');
       if (side === 'master') setMasterIn(text);
       else setScanIn(text);
       setMessage(`Loaded ${file.name} → ${side === 'master' ? 'Expected' : 'Actual'} (${lines.length} rows)`);
-    } catch (e: any) {
-      setMessage(`XLSX parse failed: ${e?.message || e}`);
+    } catch (e) {
+      setMessage(`XLSX parse failed: ${describeSpreadsheetError(e)}`);
     }
   };
 

@@ -3,10 +3,12 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { db, logAction } from '@/lib/db';
 import { safeLocalStorage } from '@/lib/safeStorage';
 import { receiveInboundTransactional } from '@/lib/lifecycle';
+import { getStockScope, type StockScope } from '@/lib/stockBalances';
+import { getActiveWarehouseCode } from '@/lib/supabaseSync';
 import { useAuth } from '@/lib/auth';
 import BarcodeReader from '@/components/BarcodeReader';
 import { Package, Plus, History, ArrowRight, AlertTriangle, ShieldCheck, FileSpreadsheet, Upload, CheckCircle, ClipboardList, Sheet } from 'lucide-react';
-import * as XLSX from 'xlsx';
+import { readWorkbookFile, sheetToKeyedRows, describeSpreadsheetError, SpreadsheetError } from '@/lib/spreadsheet';
 import type { InboundRecord, PurchaseOrder } from '@/lib/db';
 
 type ReceivingTab = 'manual' | 'excel' | 'po';
@@ -41,6 +43,7 @@ export default function InboundReceiving() {
   const [qcStatus, setQcStatus] = useState<'pending' | 'passed' | 'failed'>('pending');
   const [scanMode, setScanMode] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [scope, setScope] = useState<StockScope>({ tenantCode: '', warehouseCode: '' });
   const [message, setMessage] = useState<{ type: 'success' | 'error' | 'warning'; text: string } | null>(null);
 
   // Excel upload state
@@ -61,7 +64,12 @@ export default function InboundReceiving() {
   const [poPutawaySuggestions, setPoPutawaySuggestions] = useState<Record<string, string>>({});
 
   const loadPOs = useCallback(async () => {
-    const pos = await db.purchaseOrders.toArray();
+    const active = await getStockScope(await getActiveWarehouseCode());
+    setScope(active);
+    const pos = await db.purchaseOrders
+      .where('[tenantCode+warehouseCode]')
+      .equals([active.tenantCode, active.warehouseCode])
+      .toArray();
     setPurchaseOrders(pos);
   }, []);
 
@@ -90,7 +98,12 @@ export default function InboundReceiving() {
 
   // Directed Putaway: suggest best zone based on velocity, category, weight
   const suggestPutaway = useCallback(async (itemSku: string) => {
-    const item = await db.inventory.where({ sku: itemSku.trim() }).first();
+    const active = await getStockScope(await getActiveWarehouseCode());
+    // Only this warehouse's catalog may drive a putaway suggestion.
+    const item = await db.inventory
+      .where('[tenantCode+warehouseCode+sku]')
+      .equals([active.tenantCode, active.warehouseCode, itemSku.trim()])
+      .first();
     if (!item) return 'UNASSIGNED';
     const zones = await db.zoneCapacities.toArray();
     const velocity = item.velocity || 'medium';
@@ -145,7 +158,14 @@ export default function InboundReceiving() {
   const [recentInbound, setRecentInbound] = useState<InboundRecord[]>([]);
 
   const loadRecent = useCallback(async () => {
-    const items = await db.inbound.reverse().limit(10).toArray();
+    const active = await getStockScope(await getActiveWarehouseCode());
+    setScope(active);
+    const items = await db.inbound
+      .where('[tenantCode+warehouseCode]')
+      .equals([active.tenantCode, active.warehouseCode])
+      .reverse()
+      .limit(10)
+      .toArray();
     setRecentInbound(items);
   }, []);
 
@@ -212,6 +232,18 @@ export default function InboundReceiving() {
       setMessage({ type: 'error', text: 'Please enter a SKU' });
       return;
     }
+    if (!lotNumber.trim()) {
+      setShowAdvanced(true);
+      setMessage({
+        type: 'error',
+        text: 'A lot number is required — receipts without one cannot be FEFO-allocated or traced.',
+      });
+      return;
+    }
+    if (expiryDate && !/^\d{4}-\d{2}-\d{2}$/.test(expiryDate)) {
+      setMessage({ type: 'error', text: 'Expiry date must be ISO yyyy-mm-dd' });
+      return;
+    }
     try {
       const outcome = await processReceive(sku.trim(), qty, description, bin, {
         lot: lotNumber,
@@ -238,35 +270,42 @@ export default function InboundReceiving() {
     if (!file) return;
     setExcelFile(file);
     setCommitted(false);
-    const reader = new FileReader();
-    reader.onload = (ev) => {
+    // An inbound sheet is untrusted third-party input: it goes through the
+    // hardened boundary (size/type guards, prototype-pollution key filtering)
+    // and its headers are never used as object keys unchecked.
+    void (async () => {
       try {
-        const data = new Uint8Array(ev.target?.result as ArrayBuffer);
-        const workbook = XLSX.read(data, { type: 'array' });
-        const sheet = workbook.Sheets[workbook.SheetNames[0]];
-        const json = XLSX.utils.sheet_to_json(sheet, { header: 1 }) as any[][];
-        if (json.length > 0) {
-          const headers = json[0].map((h: any) => String(h).trim());
+        const workbook = await readWorkbookFile(file);
+        const { headers, rows, droppedHeaders } = sheetToKeyedRows(workbook.sheets[0], { maxRows: 20000 });
+        if (rows.length > 0) {
           setExcelColumns(headers);
-          const rows = json.slice(1).map((row: any[]) => {
-            const obj: Record<string, any> = {};
-            headers.forEach((h, i) => { obj[h] = row[i]; });
-            return obj;
-          }).filter(r => Object.values(r).some(v => v !== undefined && v !== ''));
-          setExcelData(rows);
+          setExcelData(rows as Record<string, unknown>[]);
           // Auto-guess columns
           const guess = (keywords: string[]) => headers.find(h => keywords.some(k => h.toLowerCase().includes(k)));
           setSkuCol(guess(['sku', 'item', 'code', 'product code']) || headers[0] || '');
           setProductCol(guess(['product', 'desc', 'name', 'title']) || headers[1] || '');
           setQtyCol(guess(['qty', 'quantity', 'count', 'amount']) || headers[2] || '');
           setLocCol(guess(['loc', 'bin', 'location', 'zone']) || '');
-          setMessage({ type: 'success', text: `Loaded ${rows.length} rows from ${file.name}` });
+          setMessage({
+            type: droppedHeaders.length ? 'warning' : 'success',
+            text: droppedHeaders.length
+              ? `Loaded ${rows.length} rows from ${file.name}; ignored unsafe/duplicate header(s): ${droppedHeaders.join(', ')}`
+              : `Loaded ${rows.length} rows from ${file.name}`,
+          });
+        } else {
+          setMessage({ type: 'warning', text: `${file.name} parsed but contained no usable rows` });
         }
-      } catch {
-        setMessage({ type: 'error', text: 'Failed to parse Excel file' });
+      } catch (err) {
+        if (err instanceof SpreadsheetError) {
+          setMessage({ type: 'error', text: err.message });
+        } else {
+          setMessage({ type: 'error', text: `Failed to parse Excel file: ${describeSpreadsheetError(err)}` });
+        }
+        setExcelFile(null);
+        setExcelData([]);
+        setPreviewRows([]);
       }
-    };
-    reader.readAsArrayBuffer(file);
+    })();
   };
 
   useEffect(() => {
@@ -343,6 +382,11 @@ export default function InboundReceiving() {
               <div className="flex items-center gap-2 mb-6">
                 <Package className="w-5 h-5 text-accent-sky" />
                 <h2 className="text-sm font-semibold text-text-primary">Receive Inventory</h2>
+                {scope.warehouseCode && (
+                  <span className="text-[10px] font-mono bg-white/[0.06] text-text-secondary px-2 py-0.5 rounded-full">
+                    {scope.warehouseCode} · {scope.tenantCode}
+                  </span>
+                )}
                 <button
                   onClick={() => setScanMode(!scanMode)}
                   className="ml-auto text-[10px] bg-accent-sky/20 text-accent-sky px-3 py-1 rounded-full hover:bg-accent-sky/30 transition-colors"
@@ -368,13 +412,30 @@ export default function InboundReceiving() {
                         <input type="number" min={1} value={qty} onChange={(e) => setQty(parseInt(e.target.value) || 1)} className="w-full bg-transparent border-b border-white/10 text-text-primary text-sm py-2 px-1 focus:outline-none focus:border-accent-sky transition-colors" />
                       </div>
                       <div>
-                        <label className="block text-[10px] text-text-secondary uppercase tracking-widest mb-1.5">Bin Location</label>
-                        <input type="text" value={bin} onChange={(e) => setBin(e.target.value.toUpperCase())} className="w-full bg-transparent border-b border-white/10 text-text-primary text-sm py-2 px-1 focus:outline-none focus:border-accent-sky transition-colors font-mono" placeholder="C4-10" />
+                        <label className="block text-[10px] text-text-secondary uppercase tracking-widest mb-1.5">Putaway bin hint</label>
+                        <input type="text" value={bin} onChange={(e) => setBin(e.target.value.toUpperCase())} className="w-full bg-transparent border-b border-white/10 text-text-primary text-sm py-2 px-1 focus:outline-none focus:border-accent-sky transition-colors font-mono" placeholder="PHONE-A-01-01" />
                       </div>
                     </div>
                   </motion.div>
                 )}
               </AnimatePresence>
+
+              {/* Lot and expiry are mandatory traceability fields, never buried
+                  behind "Advanced": a receipt without them cannot be FEFO-allocated. */}
+              <div className="grid grid-cols-2 gap-4 mb-4">
+                <div>
+                  <label className="block text-[10px] text-text-secondary uppercase tracking-widest mb-1.5">
+                    Lot Number <span className="text-accent-red">*</span>
+                  </label>
+                  <input type="text" value={lotNumber} onChange={(e) => setLotNumber(e.target.value.toUpperCase())} className="w-full bg-transparent border-b border-white/10 text-text-primary text-sm py-2 px-1 focus:outline-none focus:border-accent-sky transition-colors font-mono" placeholder="LOT-2026-11" />
+                </div>
+                <div>
+                  <label className="block text-[10px] text-text-secondary uppercase tracking-widest mb-1.5">
+                    Expiry Date <span className="text-[9px] normal-case tracking-normal text-text-secondary/70">(ISO, if perishable)</span>
+                  </label>
+                  <input type="date" value={expiryDate} onChange={(e) => setExpiryDate(e.target.value)} className="w-full bg-transparent border-b border-white/10 text-text-primary text-sm py-2 px-1 focus:outline-none focus:border-accent-sky transition-colors font-mono" />
+                </div>
+              </div>
 
               {!scanMode && (
                 <div className="mb-4">
@@ -386,7 +447,7 @@ export default function InboundReceiving() {
               <div className="mb-4">
                 <button onClick={() => setShowAdvanced(!showAdvanced)} className="text-[10px] text-accent-sky hover:text-accent-sky/80 uppercase tracking-widest flex items-center gap-1">
                   <ArrowRight className={`w-3 h-3 transition-transform ${showAdvanced ? 'rotate-90' : ''}`} />
-                  Advanced Options (Lot, Expiry, Cross-Dock, QC)
+                  Advanced Options (Cross-Dock, QC)
                 </button>
               </div>
 
@@ -394,14 +455,6 @@ export default function InboundReceiving() {
                 {showAdvanced && (
                   <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }} className="overflow-hidden">
                     <div className="grid grid-cols-2 gap-4 mb-4 p-4 bg-white/[0.02] rounded-md border border-white/[0.06]">
-                      <div>
-                        <label className="block text-[10px] text-text-secondary uppercase tracking-widest mb-1.5">Lot Number</label>
-                        <input type="text" value={lotNumber} onChange={(e) => setLotNumber(e.target.value.toUpperCase())} className="w-full bg-transparent border-b border-white/10 text-text-primary text-sm py-2 px-1 focus:outline-none focus:border-accent-sky transition-colors font-mono" placeholder="LOT-2024-001" />
-                      </div>
-                      <div>
-                        <label className="block text-[10px] text-text-secondary uppercase tracking-widest mb-1.5">Expiry Date</label>
-                        <input type="date" value={expiryDate} onChange={(e) => setExpiryDate(e.target.value)} className="w-full bg-transparent border-b border-white/10 text-text-primary text-sm py-2 px-1 focus:outline-none focus:border-accent-sky transition-colors font-mono" />
-                      </div>
                       <div>
                         <label className="block text-[10px] text-text-secondary uppercase tracking-widest mb-1.5">Cross-Dock Order ID</label>
                         <input type="text" value={crossDockOrderId} onChange={(e) => setCrossDockOrderId(e.target.value.toUpperCase())} className="w-full bg-transparent border-b border-white/10 text-text-primary text-sm py-2 px-1 focus:outline-none focus:border-accent-sky transition-colors font-mono" placeholder="ORD-XXXX" />
