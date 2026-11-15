@@ -126,28 +126,58 @@ export async function listDimensions(sku: string, scope: StockScope): Promise<St
     .toArray();
 }
 
-/** Units of a SKU already promised to orders other than `excludeOrderId`. */
-async function locallyReservedByDimension(
+/**
+ * Active promises for one SKU, grouped by the dimension they point at.
+ *
+ * Two independent records describe the same thing: the balance row's
+ * `reserved_qty` (authoritative, and what a cloud snapshot materialises) and the
+ * local reservation rows (the pick-list detail). Either one can lag the other —
+ * a cloud pull can land before our own outbox drains, and a legacy row can
+ * predate dimensional tracking. Summing them double-counts and collapses
+ * availability to zero, so callers take the MAXIMUM of the two instead (see
+ * `allocatableDimensions`).
+ */
+interface ReservationHolds {
+  /** Every active promise per dimension key, all orders included. */
+  byDimension: Map<string, number>;
+  /** The re-planning order's own promises, which must be handed back to it. */
+  ownByDimension: Map<string, number>;
+  /** Legacy promises with no bin: cannot live in any dimension's reserved_qty. */
+  unscoped: number;
+  /** The re-planning order's share of those legacy promises. */
+  unscopedOwn: number;
+}
+
+async function reservationHolds(
   sku: string,
   scope: StockScope,
   excludeOrderId?: string,
-): Promise<Map<string, number>> {
+): Promise<ReservationHolds> {
   const rows = await db.inventoryReservations
     .where('[tenantCode+warehouseCode]')
     .equals([scope.tenantCode, scope.warehouseCode])
-    .and((r) => r.sku === sku && (r.status === 'reserved' || r.status === 'allocated') && r.orderId !== excludeOrderId)
+    .and((r) => r.sku === sku && (r.status === 'reserved' || r.status === 'allocated'))
     .toArray();
 
-  const map = new Map<string, number>();
+  const byDimension = new Map<string, number>();
+  const ownByDimension = new Map<string, number>();
+  let unscoped = 0;
+  let unscopedOwn = 0;
+
   for (const r of rows) {
-    const key = dimensionKey(r.location ?? '', r.lotNumber ?? 'DEFAULT');
-    map.set(key, (map.get(key) ?? 0) + r.quantity);
+    const isOwn = Boolean(excludeOrderId) && r.orderId === excludeOrderId;
+    if (!r.location) {
+      if (isOwn) unscopedOwn += r.quantity;
+      else unscoped += r.quantity;
+      continue;
+    }
+    // Serial-less key: a reservation names a bin and lot, not an individual unit.
+    const key = dimensionKey(r.location, r.lotNumber ?? 'DEFAULT');
+    byDimension.set(key, (byDimension.get(key) ?? 0) + r.quantity);
+    if (isOwn) ownByDimension.set(key, (ownByDimension.get(key) ?? 0) + r.quantity);
   }
-  // Reservations that predate dimensional tracking have no bin: charge them
-  // against the SKU total so availability is never overstated.
-  const unscoped = rows.filter((r) => !r.location).reduce((s, r) => s + r.quantity, 0);
-  if (unscoped > 0) map.set('__unscoped__', unscoped);
-  return map;
+
+  return { byDimension, ownByDimension, unscoped, unscopedOwn };
 }
 
 export function dimensionKey(location: string, lotNumber: string, stockStatus: StockStatus = 'AVAILABLE', serialNumber?: string): string {
@@ -157,8 +187,10 @@ export function dimensionKey(location: string, lotNumber: string, stockStatus: S
 /**
  * Allocatable dimensions for a SKU in FEFO order.
  *
- * Excludes quarantine/damaged/hold rows and expired lots, and subtracts both
- * the server-side `reserved_qty` and any local promise made by another order.
+ * Excludes quarantine/damaged/hold rows and expired lots. The hold against each
+ * dimension is `max(reserved_qty, active local promises)` — never their sum,
+ * which would count the same promise twice — and an order that is re-planning
+ * gets its own promise handed back so it can re-pick the same units.
  */
 export async function allocatableDimensions(
   sku: string,
@@ -166,15 +198,19 @@ export async function allocatableDimensions(
   excludeOrderId?: string,
 ): Promise<DimensionAvailability[]> {
   const balances = await listDimensions(sku, scope);
-  const localReserved = await locallyReservedByDimension(sku, scope, excludeOrderId);
-  const unscoped = localReserved.get('__unscoped__') ?? 0;
-  let unscopedRemaining = unscoped;
+  const holds = await reservationHolds(sku, scope, excludeOrderId);
+  let unscopedRemaining = Math.max(0, holds.unscoped - holds.unscopedOwn);
 
   const rows: DimensionAvailability[] = balances
     .filter((b) => b.stockStatus === 'AVAILABLE' && !isExpired(b.expiryDate))
     .map((b) => {
-      const key = dimensionKey(b.location, b.lotNumber, 'AVAILABLE', b.serialNumber);
-      const promised = localReserved.get(key) ?? 0;
+      const key = dimensionKey(b.location, b.lotNumber);
+      const promised = holds.byDimension.get(key) ?? 0;
+      const own = holds.ownByDimension.get(key) ?? 0;
+      // Whichever record is ahead wins; the other is lagging, not additive.
+      const effectiveReserved = Math.max(b.reservedQty, promised);
+      const handedBack = Math.min(own, effectiveReserved);
+      const sellable = Math.max(0, b.onHandQty - b.quarantineQty);
       return {
         balanceId: b.id as number,
         location: b.location,
@@ -186,8 +222,9 @@ export async function allocatableDimensions(
         onHandQty: b.onHandQty,
         reservedQty: b.reservedQty,
         quarantineQty: b.quarantineQty,
-        locallyReserved: promised,
-        available: Math.max(0, availableQty(b) - promised),
+        // Promises that the balance row does not yet reflect.
+        locallyReserved: Math.max(0, effectiveReserved - b.reservedQty),
+        available: Math.max(0, sellable - effectiveReserved + handedBack),
       };
     })
     .sort(fefoCompare);

@@ -46,6 +46,40 @@ const LIFECYCLE_TABLES = () => [
 ];
 
 /**
+ * Runs one lifecycle step inside a single Dexie transaction.
+ *
+ * A rejected step rolls back everything it wrote — including any audit row that
+ * explains the rejection. Those rows are therefore collected outside the
+ * transaction and written after the abort, so a refused scan, a blocked QC
+ * checkpoint or an allocation shortfall always leaves a trace.
+ */
+async function runTransactionalStep(
+  scope: StockScope,
+  operator: string,
+  failureAudits: Array<{ action: string; details: string }>,
+  step: () => Promise<void>,
+): Promise<void> {
+  try {
+    await db.transaction('rw', LIFECYCLE_TABLES(), step);
+  } catch (err) {
+    const timestamp = new Date().toISOString();
+    for (const audit of failureAudits) {
+      await db.auditLogs
+        .add({
+          action: audit.action,
+          details: audit.details,
+          operator,
+          timestamp,
+          tenantCode: scope.tenantCode,
+          warehouseCode: scope.warehouseCode,
+        } as never)
+        .catch(() => {});
+    }
+    throw err;
+  }
+}
+
+/**
  * Resolves the tenancy scope for a lifecycle operation.
  *
  * Every mutation is stamped with BOTH tenant and warehouse, and every read is
@@ -176,6 +210,23 @@ export async function receiveInboundTransactional(input: ReceiveGrnInput): Promi
       });
 
       if (stage === 'qc_hold') {
+        // Post the received units into a QUARANTINE dimension at the dock bin.
+        // They are physically in the building, so the ledger must account for
+        // them — and release/scrap needs a real dimension to move or decrement.
+        await upsertDimension({
+          scope,
+          sku: cleanSku,
+          location: receivingBin,
+          lotNumber,
+          stockStatus: 'QUARANTINE',
+          qtyDelta: input.qty,
+          expiryDate: input.expiryDate || null,
+          operator: input.operator,
+          movementType: 'inbound',
+          note: `${grnRef}: received pending QC inspection`,
+          referenceId: grnRef,
+        });
+
         await db.qcHolds.add({
           sku: cleanSku,
           lotNumber,
@@ -225,7 +276,7 @@ export async function receiveInboundTransactional(input: ReceiveGrnInput): Promi
     }
   );
 
-  void enqueueCloudOperation(
+  await enqueueCloudOperation(
     'inbound_grn',
     {
       sku: cleanSku,
@@ -479,7 +530,7 @@ export async function dispositionQcHoldTransactional(params: {
 
   if (holdSnapshot) {
     const snap = holdSnapshot as { sku: string; quantity: number; reason: string; lotNumber?: string };
-    void enqueueCloudOperation(
+    await enqueueCloudOperation(
       'qc_release',
       {
         sku: snap.sku,
@@ -520,9 +571,10 @@ export async function completePutawayTransactional(params: {
   let finalLoc = 'PHONE-A-01';
   let finalLot = 'DEFAULT';
   let newStock = 0;
+  const failureAudits: Array<{ action: string; details: string }> = [];
   let taskSnapshot: { taskId: string; sku: string; qty: number; sourceLocation: string; lotNumber?: string } | null = null;
 
-  await db.transaction('rw', LIFECYCLE_TABLES(), async () => {
+  await runTransactionalStep(scope, params.operator, failureAudits, async () => {
     const task = await db.putawayTasks.get(params.taskId);
     if (!task) throw new Error('PUTAWAY_TASK_NOT_FOUND: Putaway task not found');
     if (task.status === 'completed') throw new Error('PUTAWAY_ALREADY_COMPLETED: Putaway task already completed');
@@ -544,11 +596,9 @@ export async function completePutawayTransactional(params: {
         scope,
       });
       if (!scan.ok) {
-        await db.auditLogs.add({
+        failureAudits.push({
           action: 'PUTAWAY_SCAN_MISMATCH',
           details: `${params.operator} scanned "${params.scannedCode}" while putting away ${task.sku} at ${finalLoc}: ${scan.error}`,
-          operator: params.operator,
-          timestamp: now,
         });
         throw new Error(`${scan.code}: ${scan.error}`);
       }
@@ -639,7 +689,7 @@ export async function completePutawayTransactional(params: {
 
   if (taskSnapshot) {
     const snap = taskSnapshot as { taskId: string; sku: string; qty: number };
-    void enqueueCloudOperation(
+    await enqueueCloudOperation(
       'putaway_complete',
       {
         taskNumber: snap.taskId,
@@ -680,8 +730,11 @@ export async function confirmPickAndPackTransactional(params: {
   const scope = await resolveScope({ tenantCode: params.tenantCode, warehouseCode: params.warehouseCode });
   let orderIdStr = '';
   const pickedBins: Array<{ sku: string; location: string; lotNumber: string; qty: number }> = [];
+  // Audit rows describing a REJECTED step cannot live inside the transaction
+  // that is about to roll back, or the rejection leaves no trace at all.
+  const failureAudits: Array<{ action: string; details: string }> = [];
 
-  await db.transaction('rw', LIFECYCLE_TABLES(), async () => {
+  await runTransactionalStep(scope, params.operator, failureAudits, async () => {
       const order = await db.orders.get(params.orderRecordId);
       if (!order) throw new Error('ORDER_NOT_FOUND: Order not found');
       if (order.status === 'Shipped') throw new Error('LIFECYCLE_VIOLATION: Order has already been shipped');
@@ -706,11 +759,9 @@ export async function confirmPickAndPackTransactional(params: {
           scope,
         });
         if (!scan.ok) {
-          await db.auditLogs.add({
+          failureAudits.push({
             action: 'PICK_SCAN_MISMATCH',
             details: `${params.operator} packed ${line.picked}× ${line.sku} for ${order.orderId} with scan "${line.scannedCode ?? ''}": ${scan.error}`,
-            operator: params.operator,
-            timestamp: now,
           });
           throw new Error(`${scan.code}: ${scan.error}`);
         }
@@ -794,7 +845,7 @@ export async function confirmPickAndPackTransactional(params: {
     }
   );
 
-  void enqueueCloudOperation(
+  await enqueueCloudOperation(
     'confirm_packed',
     {
       orderId: orderIdStr,
@@ -833,8 +884,9 @@ export async function dispatchShipmentTransactional(params: {
   const shipmentRef = `SHP-${Date.now()}`;
   let orderIdStr = '';
   const dispatchedBins: Array<{ sku: string; location: string; lotNumber: string; qty: number }> = [];
+  const failureAudits: Array<{ action: string; details: string }> = [];
 
-  await db.transaction('rw', LIFECYCLE_TABLES(), async () => {
+  await runTransactionalStep(scope, params.operator, failureAudits, async () => {
       const order = await db.orders.get(params.orderRecordId);
       if (!order) throw new Error('ORDER_NOT_FOUND: Order not found');
       if (order.status === 'Shipped') throw new Error('LIFECYCLE_VIOLATION: Order is already dispatched');
@@ -867,7 +919,25 @@ export async function dispatchShipmentTransactional(params: {
       // belongs to another wave, nor decrement a per-SKU total that no longer
       // reflects the physical layout.
       for (const [sku, qty] of Object.entries(counts)) {
-        let remaining = qty;
+        // Units already picked and packed for this order have physically left
+        // the bin; dispatch must ship them, not try to reserve them again.
+        const pickedRes = await db.inventoryReservations
+          .where('orderId')
+          .equals(order.orderId)
+          .filter((r) => r.sku === sku && r.status === 'picked')
+          .toArray();
+        const alreadyPicked = pickedRes.reduce((sum, r) => sum + r.quantity, 0);
+        for (const r of pickedRes) {
+          dispatchedBins.push({
+            sku,
+            location: r.location ?? 'UNSPECIFIED',
+            lotNumber: r.lotNumber ?? 'DEFAULT',
+            qty: r.quantity,
+          });
+        }
+
+        let remaining = Math.max(0, qty - alreadyPicked);
+        if (remaining === 0) continue;
 
         const ownRes = await db.inventoryReservations
           .where('orderId')
@@ -892,11 +962,9 @@ export async function dispatchShipmentTransactional(params: {
         if (remaining > 0) {
           const plan = await planFefoAllocation(sku, remaining, scope, order.orderId);
           if (plan.shortfall > 0) {
-            await db.auditLogs.add({
+            failureAudits.push({
               action: 'ALLOCATION_CONFLICT',
               details: `Dispatch of ${order.orderId} blocked: ${sku} short ${plan.shortfall} unit(s) in ${scope.warehouseCode}`,
-              operator: params.operator,
-              timestamp: now,
             });
             throw new Error(
               `INSUFFICIENT_STOCK: Cannot dispatch ${order.orderId}; ${sku} is short ${plan.shortfall} allocatable unit(s) in ${scope.warehouseCode}`
@@ -959,7 +1027,7 @@ export async function dispatchShipmentTransactional(params: {
     }
   );
 
-  void enqueueCloudOperation(
+  await enqueueCloudOperation(
     'dispatch_order',
     {
       orderId: orderIdStr,
@@ -1128,7 +1196,7 @@ export async function processReturnTransactional(params: {
     }
   );
 
-  void enqueueCloudOperation(
+  await enqueueCloudOperation(
     'return_rma',
     {
       orderId: params.orderId || '',
