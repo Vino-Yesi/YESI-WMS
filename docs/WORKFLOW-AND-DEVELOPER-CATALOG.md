@@ -107,6 +107,13 @@
 
 ## Part IV — Developer Guide: Build, Develop & Deployment Procedures
 
+> The copy-paste, step-by-step version of everything in this part — including the
+> CI-built drop-file (drag-and-drop) release flow, the post-deploy verification
+> runbook and the secure-context (`INSECURE_CONTEXT`) troubleshooting notes — lives
+> in [`docs/BUILD-DEVELOP-DEPLOY-SOP.md`](BUILD-DEVELOP-DEPLOY-SOP.md). This part
+> stays the architecture-flavoured reference; the SOP is what you follow at a
+> terminal.
+
 ### 1. Prerequisites
 - **Node.js**: `v20 LTS` or `v22+` (`npm 10+`)
 - **Optional (Desktop / Native Mobile)**: Rust stable toolchain (`rustup`), Tauri CLI v2 (`@tauri-apps/cli`), Windows WebView2 / MSVC or Xcode / Android SDK

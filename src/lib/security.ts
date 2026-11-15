@@ -14,6 +14,24 @@ const KEY_DB_NAME = 'yesi_wms_keystore_v1';
 const KEY_STORE_NAME = 'keys';
 const SESSION_KEY_ID = 'aes_gcm_session_key';
 
+/**
+ * Browsers only expose `crypto.subtle` in a secure context (HTTPS, localhost, or
+ * a desktop webview origin they treat as trusted). On a plain-HTTP host it is
+ * `undefined`, and every PBKDF2/AES-GCM call below dies with a TypeError that
+ * says nothing about the real cause ("Cannot read properties of undefined
+ * (reading 'importKey')"). Fail with an error that names the cause and the fix
+ * instead, so operators and the boot banner can act on it.
+ */
+export function assertSecureCrypto(): void {
+  if (typeof crypto === 'undefined' || crypto.subtle == null) {
+    throw new Error(
+      'INSECURE_CONTEXT: this page is not in a secure context (HTTPS or localhost), so the browser withholds Web Crypto. ' +
+        'Password hashing and the encrypted session envelope cannot run here. Serve YESI-WMS over TLS — see ' +
+        'docs/BUILD-DEVELOP-DEPLOY-SOP.md, "Before any deploy" — then reload.',
+    );
+  }
+}
+
 function bytesToHex(bytes: Uint8Array): string {
   return Array.from(bytes)
     .map((b) => b.toString(16).padStart(2, '0'))
@@ -51,6 +69,7 @@ export function isHashedSecret(value: string | undefined | null): boolean {
 }
 
 export async function hashPasswordLocal(password: string): Promise<string> {
+  assertSecureCrypto();
   if (isHashedSecret(password)) return password;
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const enc = new TextEncoder();
@@ -80,6 +99,7 @@ export async function hashPasswordLocal(password: string): Promise<string> {
  * legacy or tampered plaintext records can never bypass hashing.
  */
 export async function verifyPasswordLocal(password: string, stored: string): Promise<boolean> {
+  assertSecureCrypto();
   if (!stored || !isHashedSecret(stored)) {
     return false;
   }
@@ -124,6 +144,7 @@ export async function verifyPasswordLocal(password: string, stored: string): Pro
 let fallbackMemoryKey: CryptoKey | null = null;
 
 async function getOrCreateSessionCryptoKey(): Promise<CryptoKey> {
+  assertSecureCrypto();
   const getFallbackKey = async () => {
     if (!fallbackMemoryKey) {
       fallbackMemoryKey = await crypto.subtle.generateKey(

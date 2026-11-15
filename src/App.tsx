@@ -257,10 +257,15 @@ export default function App() {
       } catch (err) {
         // Resilient degraded boot: never hang on a blank spinner if IndexedDB is blocked/corrupted
         if (!cancelled) {
+          const message = err instanceof Error ? err.message : '';
           setBootWarning(
-            err instanceof Error
-              ? `Local edge database degraded (${err.message}). Continuing in resilient mode.`
-              : 'Local edge database degraded.'
+            // A missing secure context is a deployment fault, not a database
+            // fault: label it as such instead of quoting a TypeError.
+            message.startsWith('INSECURE_CONTEXT')
+              ? message
+              : err instanceof Error
+                ? `Local edge database degraded (${message}). Continuing in resilient mode.`
+                : 'Local edge database degraded.'
           );
           setBootState('degraded');
         }
