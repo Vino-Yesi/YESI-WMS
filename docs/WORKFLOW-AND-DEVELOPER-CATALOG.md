@@ -210,9 +210,28 @@ published with the same release, so the scan either runs the exact binary we ask
 for or fails loudly. `GITLEAKS_BIN` is an escape hatch for air-gapped runners; CI
 does not set it.
 
-A historical finding needs a history rewrite plus credential rotation, so it must
-never block an unrelated pull request — hence the advisory nightly job. If it
-reports something, rotate the credential first, then decide about the rewrite.
+Findings are rendered into the job summary (rule, file, line, commit, author,
+entropy — the secret itself is masked by `--redact=100`) and uploaded as a JSON
+artifact, because an advisory scan whose results only exist in a red log is
+worthless. The upload step carries `if: always()`, which is precisely the case it
+exists for.
+
+A historical finding needs credential rotation and possibly a history rewrite, so
+it must never block an unrelated pull request — hence the advisory nightly job.
+If it reports something: judge whether the value was ever actually secret, rotate
+it if it was, and only then consider a rewrite. Vetted exceptions go in
+`.gitleaksignore` using the **commit-scoped** form
+(`commit:file:rule-id:start-line`); the global form (`file:rule-id:start-line`)
+would also silence the same file and line in future commits, which is exactly
+where the next real secret would appear.
+
+The two entries currently in `.gitleaksignore` were accepted on 2026-11-15: the
+Supabase **publishable** (anon) key committed in `70405ba` at `.env.example:3` and
+`src/lib/supabase.ts:4`. A publishable key ships inside every browser bundle and
+grants nothing beyond what RLS allows — it was never a secret — and both lines are
+gone from the current tree (`.env.example` ships empty values; `supabase.ts` has no
+hard-coded fallback and drops into Offline-Edge mode without one). Rotating it in
+the Supabase dashboard is still recommended if you want the historical value dead.
 
 ---
 
