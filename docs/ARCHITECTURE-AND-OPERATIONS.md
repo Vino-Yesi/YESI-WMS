@@ -97,7 +97,7 @@ Legacy throughput columns plus the v3 reliability columns added by migration `00
 | POST | `telemetry` | Batches client telemetry into `wms_operational_telemetry` |
 | POST | `outbox_metrics` | Counters + the dead-letter queue |
 | POST | `flush_outbox` | Claims a leased batch and delivers to configured HTTP subscribers (HMAC-signed), reporting `claimed`/`delivered`/`broadcast`/`failed`/`dead_lettered` |
-| POST | `webhook_order` | Marketplace/ERP ingestion; requires a valid `x-wms-signature` HMAC |
+| POST | `webhook_order` | Marketplace/ERP ingestion; requires `x-yesi-signature` (HMAC-SHA256 of the raw body) or `x-webhook-secret` (raw secret) |
 
 Secrets (set with `supabase secrets set`, never in `.env`): `WMS_ALLOWED_ORIGINS`, `WMS_METRICS_TOKEN`, `WMS_WEBHOOK_SECRET`. With `WMS_ALLOWED_ORIGINS` unset the gateway **denies all browser origins** — server-to-server calls still work. Malformed JSON returns `{ok:false, error:'INVALID_JSON_PAYLOAD'}` with HTTP 400 rather than a parser stack trace.
 
